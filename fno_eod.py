@@ -987,6 +987,9 @@ def main():
     ap.add_argument("--csv", action="store_true",
                     help="also send every sheet as a CSV (off by default: the "
                          "workbook already holds all of them)")
+    ap.add_argument("--skip-if-sent", action="store_true",
+                    help="exit quietly when the latest session was already delivered "
+                         "(lets the schedule run daily without resending on holidays)")
     ap.add_argument("--wait", type=int, default=0,
                     help="minutes to keep retrying if today's file is not up yet")
     ap.add_argument("--keep-cache", action="store_true")
@@ -1007,6 +1010,11 @@ def main():
     if len(dates) < 5:
         sys.exit("could not resolve enough sessions - NSE archive unreachable?")
     print(f"  {dates[0]} .. {dates[-1]}  ({len(dates)} sessions)")
+    if args.skip_if_sent:
+        shard = os.path.join("data", "history", f"{dates[-1]}.csv.gz")
+        if os.path.exists(shard):
+            print(f"{dates[-1]} already delivered - nothing to do")
+            return
 
     print("downloading + parsing ...")
     cash, fut, opt = build(dates)
