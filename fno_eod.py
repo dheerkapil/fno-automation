@@ -341,7 +341,7 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
         for c in cols:
             oa[f"CE_lots_{c}"] = ce[c]
             oa[f"PE_lots_{c}"] = pe[c]
-        out["op_alys_data"] = oa.round(2).sort_index().rename_axis("SYMBOL")
+        out["op_alys_data"] = oa.round(0).sort_index().rename_axis("SYMBOL")
 
     # ---------------- buildup + divergence --------------------------------
     idx = price.index.intersection(oi_pct.index)
@@ -395,6 +395,8 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
     syms = sorted(price.index)      # F&O universe only - keeps the sheet small
     wide = pd.DataFrame(index=syms)
     for mname, frame in src.items():
+        if mname in ("CE OI lots", "PE OI lots"):
+            frame = frame.round(0)
         for c in cols:
             wide[f"{mname}|{c}"] = (frame.reindex(syms)[c] if c in frame.columns
                                     else pd.NA)
@@ -576,12 +578,13 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
                     colmap[c] = col
                     pct = (str(c).startswith(("OIchg%", "PxChg%"))
                            or str(c).endswith("_div%"))
-                    whole = str(c).startswith("OIperTrade")
+                    whole = (str(c).startswith("OIperTrade")
+                             or str(c).startswith(("CE_lots", "PE_lots")))
                     for i, v in enumerate(df[c].tolist(), start=4):
                         cell = ws.cell(row=i, column=col, value=v)
                         if isinstance(v, float):
                             cell.number_format = ("0.00%" if pct else
-                                                  "0" if whole else "#,##0.##")
+                                                  "#,##0" if whole else "#,##0.##")
                     ws.column_dimensions[get_column_letter(col)].width = 8
                     col += 1
                 last = col - 1
@@ -716,7 +719,8 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
                             value=f"=IFERROR(INDEX(panel_data!$B${first_sym_row}:${last_data_col}${last_sym_row},"
                                   f"MATCH($B$1,panel_data!$A${first_sym_row}:$A${last_sym_row},0),{k}),\"\")")
                     ws.cell(row=i, column=j).number_format = (
-                        "0.00%" if str(m) == "OI chg %" else "#,##0.##")
+                        "0.00%" if str(m) == "OI chg %" else
+                        "#,##0" if "OI lots" in str(m) else "#,##0.##")
             from openpyxl.worksheet.datavalidation import DataValidation
             dv = DataValidation(type="list",
                                 formula1=f"=panel_data!$A$4:$A${4 + len(syms) - 1}",
