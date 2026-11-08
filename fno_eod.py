@@ -323,7 +323,10 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
     # ---------------- options ---------------------------------------------
     op = opt[opt["date"].isin(lab)].copy()
     op["day"] = op["date"].map(lab)
-    op["oi_lots"] = pd.to_numeric(op["oi_lots"], errors="coerce")
+    # the master's options block is the CHANGE in OI, in lots, signed -
+    # not the OI level
+    op["oi_lots"] = (pd.to_numeric(op["ChngInOpnIntrst"], errors="coerce")
+                     / op["lot"].replace(0, pd.NA))
     op = op.dropna(subset=["oi_lots"])
     ce = pe = None
     if not op.empty:
@@ -605,7 +608,7 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
             if name == "op_alys_data" and block_spans:
                 f0, l0 = block_spans[0][1], block_spans[-1][2]
                 ws.merge_cells(start_row=1, start_column=f0, end_row=1, end_column=l0)
-                ws.cell(row=1, column=f0, value="CE / PE OI (lots)")
+                ws.cell(row=1, column=f0, value="CE / PE OI change (lots)")
 
             # per-row colour scale inside each dataset - but only on the blocks
             # the master scales. Delivery % and qty/trade are NOT colour-scaled
