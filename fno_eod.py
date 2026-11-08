@@ -539,9 +539,18 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
                     ws.merge_cells(start_row=1, start_column=first, end_row=1, end_column=last)
                     ws.cell(row=1, column=first, value=gname)
                     block_spans.append((gname, first, last))
-            # per-row colour scale inside each dataset
+            # per-row colour scale inside each dataset - but only on the blocks
+            # the master scales. Delivery % and qty/trade are NOT colour-scaled
+            # there: they carry the blue/grey above-average highlight instead,
+            # and a scale on top would drown it out.
+            SCALED = {"cash_alys_fno": {"Close", "Volume"},
+                      "fut_alys_data": {"Settle", "OIchg%", "OIperTrade", "OI"},
+                      "buildup_summary": {"DIVERGENCE"}}
+            allowed = SCALED.get(name)
             for gname, first, last in block_spans:
                 if not gname or gname == "SIGNAL":
+                    continue
+                if allowed is not None and gname not in allowed:
                     continue
                 for r in range(4, n_rows + 4):
                     ws.conditional_formatting.add(
