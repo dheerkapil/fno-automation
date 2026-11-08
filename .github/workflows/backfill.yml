@@ -1,0 +1,58 @@
+name: Backfill history
+
+# One-off (or occasional) job: builds data/history/<session>.csv.gz for every
+# trading day since NSE switched to the UDiFF bhavcopy format (2024-07-08).
+# Safe to re-run - existing shards are skipped, only missing days are fetched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "First session to fetch (YYYY-MM-DD)"
+        required: false
+        default: "2024-07-08"
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Backfill sessions
+        run: python backfill.py --from "${{ inputs.start }}"
+
+      - name: Commit shards
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/history
+          git diff --cached --quiet || git commit -m "Backfill history from ${{ inputs.start }} through $(date -u +%F)"
+          git push
+
+      - name: Report coverage
+        run: |
+          python - <<'PY'
+          import glob, gzip, os
+          files = sorted(glob.glob("data/history/*.csv.gz"))
+          rows = sum(sum(1 for _ in gzip.open(f, "rt")) - 1 for f in files)
+          size = sum(os.path.getsize(f) for f in files) / 1e6
+          print(f"{len(files)} sessions, {rows:,} rows, {size:.1f} MB")
+          open("coverage.txt", "w").write(
+              f"sessions: {len(files)}\nrows: {rows}\n"
+              f"first: {os.path.basename(files[0]) if files else '-'}\n"
+              f"last:  {os.path.basename(files[-1]) if files else '-'}\nsize_mb: {size:.1f}\n")
+          PY
+          cat coverage.txt
