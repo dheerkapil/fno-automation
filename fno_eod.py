@@ -264,15 +264,18 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
     for c in cols:
         ca[f"Qty/Trade_{c}"] = qt[c]
     ind = industry_map()
-    ca.insert(0, "industry", [ind.get(sym, "") for sym in ca.index])
+    # parked last so the four blocks land on the master's F / AC / BA / BY
+    ca["industry"] = [ind.get(sym, "") for sym in ca.index]
     # assigned after the futures universe is known (see below)
 
     # ---------------- futures ---------------------------------------------
     fut = fut[fut["date"].isin(lab)].copy()
     fut["day"] = fut["date"].map(lab)
     fut = fut.dropna(subset=["OpnIntrst"]).sort_values(["TckrSymb", "XpryDt", "date"])
+    # fractions, not percent numbers: the master stores 0.0402 and formats it
+    # as 4.02% (its cash sheet is the opposite - 38.24 means 38.24%)
     fut["px_chg%"] = (fut.groupby(["TckrSymb", "XpryDt"], group_keys=False)["SttlmPric"]
-                         .pct_change(fill_method=None) * 100)
+                         .pct_change(fill_method=None))
     near = fut.loc[fut.groupby(["TckrSymb", "day"])["XpryDt"].idxmin()]
     price = near.pivot_table(index="TckrSymb", columns="day", values="SttlmPric", aggfunc="last").reindex(columns=cols)
     px_pct = near.pivot_table(index="TckrSymb", columns="day", values="px_chg%", aggfunc="last").reindex(columns=cols)
@@ -281,7 +284,7 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
     agg = fut.groupby(["TckrSymb", "day"]).agg(
         oi=("OpnIntrst", "sum"), coi=("ChngInOpnIntrst", "sum"),
         trades=("TtlNbOfTxsExctd", "sum")).reset_index()
-    agg["oi_pct"] = agg["coi"] / (agg["oi"] - agg["coi"]).replace(0, pd.NA) * 100
+    agg["oi_pct"] = agg["coi"] / (agg["oi"] - agg["coi"]).replace(0, pd.NA)
     agg["ct_per_trade"] = agg["coi"] / agg["trades"].replace(0, pd.NA)
     oi = agg.pivot_table(index="TckrSymb", columns="day", values="oi", aggfunc="last").reindex(columns=cols)
     oi_pct = agg.pivot_table(index="TckrSymb", columns="day", values="oi_pct", aggfunc="last").reindex(columns=cols)
@@ -289,21 +292,24 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
                                  aggfunc="last").reindex(columns=cols)
                     .div(lot.replace(0, pd.NA)))
 
+    # column order copied from the master: price, OI % change, futures TQ/NT
+    # (with its average), cumulative OI, then price % change
     fa = pd.DataFrame(index=price.index)
     fa["min"] = price.min(axis=1)
     fa["max"] = price.max(axis=1)
-    fa["lot"] = lot[cols[-1]]
     for c in cols:
         fa[f"Settle_{c}"] = price[c]
-    for c in cols:
-        fa[f"PxChg%_{c}"] = px_pct[c]
-    for c in cols:
-        fa[f"OI_{c}"] = oi[c]
     for c in cols:
         fa[f"OIchg%_{c}"] = oi_pct[c]
     for c in cols:
         fa[f"OIperTrade_{c}"] = per_trade[c]
     fa["OIperTrade_20D_avg"] = per_trade.mean(axis=1)      # the master's BP column
+    for c in cols:
+        fa[f"OI_{c}"] = oi[c]
+    for c in cols:
+        fa[f"PxChg%_{c}"] = px_pct[c]
+    fa["lot"] = lot[cols[-1]]        # parked last so the five blocks land on
+                                     # the master's F / AA / AV / BR / CN
     out["fut_alys_data"] = fa.round(2).sort_index().rename_axis("SYMBOL")
     # the master's cash sheet lists the F&O universe, not all ~2,800 cash symbols
     out["cash_alys_fno"] = ca.loc[ca.index.intersection(price.index)].round(2).sort_index()
@@ -327,12 +333,11 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
                                                      values="oi_lots", aggfunc="sum")
               .reindex(columns=cols))
         oa = pd.DataFrame(index=ce.index.union(pe.index))
+        # CE and PE side by side for each day, the master's layout - not two
+        # separate 20-column blocks
         for c in cols:
             oa[f"CE_lots_{c}"] = ce[c]
-        for c in cols:
             oa[f"PE_lots_{c}"] = pe[c]
-        for c in cols:
-            oa[f"PCR_{c}"] = (pe[c] / ce[c].replace(0, pd.NA))
         out["op_alys_data"] = oa.round(2).sort_index().rename_axis("SYMBOL")
 
     # ---------------- buildup + divergence --------------------------------
@@ -344,38 +349,25 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
             continue
         s = pd.Series("", index=idx, dtype=object)
         up, dn = p > 0, p < 0
-        s[up & (o > threshold * 100)] = "LB"
-        s[dn & (o > threshold * 100)] = "SB"
-        s[up & (o < -threshold * 100)] = "SC"
-        s[dn & (o < -threshold * 100)] = "LU"
+        s[up & (o > threshold)] = "LB"
+        s[dn & (o > threshold)] = "SB"
+        s[up & (o < -threshold)] = "SC"
+        s[dn & (o < -threshold)] = "LU"
         sig[c] = s
 
     div = pd.DataFrame(index=idx, columns=cols, dtype=float)
     for c in cols:
         spot = cash_close.reindex(idx).get(c)
         if spot is not None:
-            div[c] = ((price.get(c) - spot) / spot).abs() * 100
+            div[c] = ((price.get(c) - spot) / spot).abs()
     div.columns = [f"{c}_div%" for c in cols]
     out["buildup_summary"] = sig.join(div.round(2)).sort_index().rename_axis("SYMBOL")
-
-    # ---------------- nifty_delivery (hidden support sheet) ---------------
-    ind_map = industry_map()
-    n500 = [s_ for s_ in px.index if s_ in ind_map]
-    nd = pd.DataFrame(index=sorted(n500))
-    for c in cols:
-        nd[f"Deliv_{c}"] = delq.reindex(nd.index)[c]
-    for c in cols:
-        nd[f"Vol_{c}"] = qty.reindex(nd.index)[c]
-    for c in cols:
-        nd[f"Deliv%_{c}"] = (delq.reindex(nd.index)[c]
-                             / qty.reindex(nd.index)[c].replace(0, pd.NA) * 100)
-    out["nifty_delivery"] = nd.round(2)
 
     # ---------------- one-stock panel + normalised twin -------------------
     focus = pick_focus(sig, oi_pct, cols)
 
     metrics = [
-        ("Date", pd.Series({c: d.strftime("%d-%b-%Y") for c, d in zip(cols, dates)})),
+        ("Date", pd.Series({c: d.strftime("%d.%m.%y") for c, d in zip(cols, dates)})),
         ("Cash Price", cash_close.loc[focus] if focus in cash_close.index else None),
         ("Volume", qty.loc[focus] if focus in qty.index else None),
         ("Delivery%", dv.loc[focus] if focus in dv.index else None),
@@ -386,8 +378,7 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
         ("FNO Contracts/Trade", per_trade.loc[focus] if focus in per_trade.index else None),
     ]
     if ce is not None and focus in ce.index:
-        metrics += [("CE OI lots", ce.loc[focus]), ("PE OI lots", pe.loc[focus]),
-                    ("PCR", pe.loc[focus] / ce.loc[focus].replace(0, pd.NA))]
+        metrics += [("CE OI lots", ce.loc[focus]), ("PE OI lots", pe.loc[focus])]
     if focus in sig.index:
         metrics += [("Signal", sig.loc[focus])]
 
@@ -406,35 +397,6 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
             continue
         norm.loc[name] = ((row - row.min()) / (row.max() - row.min())).round(3)
     out["normalized_data"] = norm
-
-    # ---------------- control panel ---------------------------------------
-    rows = [{"Days": c, "Date": d.strftime("%d-%b-%Y"), "ReportDate": d.strftime("%d%m%Y")}
-            for c, d in zip(cols, dates)]
-    rows += [
-        {"Days": "", "Date": "", "ReportDate": ""},
-        {"Days": "Threshold Buildup Change", "Date": threshold, "ReportDate": ""},
-        {"Days": "Sessions", "Date": len(dates), "ReportDate": ""},
-        {"Days": "F&O symbols", "Date": len(price.index), "ReportDate": ""},
-        {"Days": "Cash symbols", "Date": len(px.index), "ReportDate": ""},
-        {"Days": "Focus symbol", "Date": focus, "ReportDate": ""},
-        {"Days": "Generated", "Date": dt.datetime.now().strftime("%d-%b-%Y %H:%M"),
-         "ReportDate": ""},
-    ]
-    out["general"] = pd.DataFrame(rows)
-
-    if raw:
-        # the master's three hidden data sheets, for the latest session only -
-        # enough to eyeball the source rows without shipping 620k option lines
-        last_day = dates[-1]
-        out["cash_data"] = (cash[cash["date"] == last_day]
-                            .drop(columns=["date", "day"], errors="ignore")
-                            .sort_values("SYMBOL"))
-        out["futures_data"] = (fut[fut["date"] == last_day]
-                               .drop(columns=["date", "day"], errors="ignore")
-                               .sort_values("TckrSymb"))
-        out["options_data"] = (opt[opt["date"] == last_day]
-                               .drop(columns=["date", "day"], errors="ignore")
-                               .sort_values(["TckrSymb", "XpryDt", "OptnTp"]))
 
     out["_focus"] = focus
     return out
@@ -506,16 +468,16 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.formatting.rule import ColorScaleRule, FormulaRule
+    from openpyxl.styles import Border, Side
     from openpyxl.utils import get_column_letter
 
     out = {k: v for k, v in out.items() if not k.startswith("_")}
-    order = ["general", "cash_alys_fno", "fut_alys_data", "op_alys_data",
-             "buildup_summary", "nifty_delivery", "stock_specific_data",
-             "normalized_data"]
-    HIDDEN = {"general", "nifty_delivery", "normalized_data"}
+    order = ["cash_alys_fno", "fut_alys_data", "op_alys_data",
+             "buildup_summary", "stock_specific_data", "normalized_data"]
+    HIDDEN = {"normalized_data"}      # only because the chart reads from it
     wb = Workbook()
     wb.remove(wb.active)
-    date_lbl = {f"D{i+1}": d.strftime("%d-%b-%y") for i, d in enumerate(dates)}
+    date_lbl = {f"D{i+1}": d.strftime("%d.%m.%y") for i, d in enumerate(dates)}
 
     for name in [n for n in order if n in out] + [n for n in out if n not in order]:
         df = out[name]
@@ -525,18 +487,22 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
         grid = name in ("cash_alys_fno", "fut_alys_data", "op_alys_data",
                         "nifty_delivery", "buildup_summary")
         n_rows = len(df)
-        col = 1
-        hide_cols, block_spans = [], []
+        col = 2                       # column A is the master's hidden spacer
+        hide_cols, block_spans, colmap = [1], [], {}
 
-        # index column
-        ws.cell(row=2, column=col, value=df.index.name or "SYMBOL")
-        for i, v in enumerate(df.index, start=4):
-            ws.cell(row=i, column=col, value=str(v))
-        ws.column_dimensions[get_column_letter(col)].width = 15
-        col += 1
+        # index column (grid sheets only - the plain sheets label rows in A)
+        if grid:
+            ws.cell(row=2, column=col, value=df.index.name or "SYMBOL")
+            for i, v in enumerate(df.index, start=4):
+                ws.cell(row=i, column=col, value=str(v))
+            ws.column_dimensions[get_column_letter(col)].width = 15
+            col += 1
 
         if grid:
-            groups = _plan(df)
+            if name == "op_alys_data":
+                groups = [("CE / PE OI (lots)", list(df.columns))]
+            else:
+                groups = _plan(df)
             for gname, cols in groups:
                 if gname:                       # day-block: give it a blue divider
                     ws.column_dimensions[get_column_letter(col)].width = 2.2
@@ -547,20 +513,25 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
                 for c in cols:
                     d = _day_index(c)
                     if d is not None:
-                        ws.cell(row=2, column=col, value=f"D{d}")
-                        ws.cell(row=3, column=col, value=date_lbl.get(f"D{d}", ""))
+                        pair_pe = str(c).startswith("PE_lots")
+                        ws.cell(row=2, column=col, value="" if pair_pe else f"D{d}")
+                        ws.cell(row=3, column=col, value="" if pair_pe else date_lbl.get(f"D{d}", ""))
+                        # only these two sheets fold the older sessions away;
+                        # options, buildup and nifty_delivery show all 20 days
                         if master_layout and d <= 20 - show_days and \
-                           name in ("cash_alys_fno", "fut_alys_data", "op_alys_data",
-                                    "nifty_delivery", "buildup_summary"):
+                           name in ("cash_alys_fno", "fut_alys_data"):
                             hide_cols.append(col)
                     else:
                         ws.cell(row=2, column=col, value=SCALAR_SHORT.get(c, str(c)[:8]))
                         if master_layout and c in SUPPORT_COLS:
                             hide_cols.append(col)
+                    colmap[c] = col
+                    pct = (str(c).startswith(("OIchg%", "PxChg%"))
+                           or str(c).endswith("_div%"))
                     for i, v in enumerate(df[c].tolist(), start=4):
                         cell = ws.cell(row=i, column=col, value=v)
                         if isinstance(v, float):
-                            cell.number_format = "#,##0.##"
+                            cell.number_format = "0.00%" if pct else "#,##0.##"
                     ws.column_dimensions[get_column_letter(col)].width = 8
                     col += 1
                 last = col - 1
@@ -579,6 +550,48 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
                                        mid_type="percentile", mid_value=50,
                                        mid_color="FFEB84", end_type="max",
                                        end_color="63BE7B"))
+            # delivery % and qty/trade: the master's two-tier highlight
+            if name == "cash_alys_fno" and "deliv%_20D" in colmap:
+                agd = get_column_letter(colmap["deliv%_20D"])
+                agq = get_column_letter(colmap.get("qty/trade_20D", colmap["deliv%_20D"]))
+                first_row, last_row = 4, n_rows + 3
+                for c, ci in colmap.items():
+                    if not re.search(r"_D\d+$", str(c)):
+                        continue
+                    L = get_column_letter(ci)
+                    if str(c).startswith("Deliv%"):
+                        q = colmap.get(re.sub(r"^Deliv%", "Qty/Trade", c))
+                        if q:
+                            Q = get_column_letter(q)
+                            ws.conditional_formatting.add(
+                                f"{L}{first_row}:{L}{last_row}",
+                                FormulaRule(formula=[f"AND({L}{first_row}>${agd}{first_row},"
+                                                     f"{Q}{first_row}>${agq}{first_row})"],
+                                            fill=PatternFill("solid", bgColor=HILITE_GREY)))
+                        ws.conditional_formatting.add(
+                            f"{L}{first_row}:{L}{last_row}",
+                            FormulaRule(formula=[f"{L}{first_row}>${agd}{first_row}"],
+                                        fill=PatternFill("solid", bgColor=HILITE_BLUE)))
+                    elif str(c).startswith("Qty/Trade"):
+                        ws.conditional_formatting.add(
+                            f"{L}{first_row}:{L}{last_row}",
+                            FormulaRule(formula=[f"{L}{first_row}>${agq}{first_row}"],
+                                        fill=PatternFill("solid", bgColor=HILITE_BLUE)))
+
+            # futures: thin box where OI per contract beats its own average
+            if name == "fut_alys_data" and "OIperTrade_20D_avg" in colmap:
+                ag = get_column_letter(colmap["OIperTrade_20D_avg"])
+                pt = [get_column_letter(ci) for c, ci in sorted(colmap.items(), key=lambda kv: kv[1])
+                      if str(c).startswith("OIperTrade_") and not str(c).endswith("_avg")]
+                oi = [get_column_letter(ci) for c, ci in sorted(colmap.items(), key=lambda kv: kv[1])
+                      if str(c).startswith("OIchg%_")]
+                if pt and oi:
+                    ws.conditional_formatting.add(
+                        f"{oi[0]}4:{oi[-1]}{n_rows + 3}",
+                        FormulaRule(formula=[f"${pt[0]}4>${ag}4"],
+                                    border=Border(left=Side(style="thin"), right=Side(style="thin"),
+                                                  top=Side(style="thin"), bottom=Side(style="thin"))))
+
             # signal fills
             if name == "buildup_summary":
                 for gname, first, last in block_spans:
@@ -591,7 +604,11 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
                             FormulaRule(formula=[f'{c0}4="{code}"'],
                                         fill=PatternFill("solid", bgColor=rgb)))
         else:
-            # plain sheets: single header row, no blocks
+            # plain sheets: row labels in A, single header row, no blocks
+            for i, v in enumerate(df.index, start=4):
+                ws.cell(row=i, column=1, value=str(v))
+            ws.column_dimensions["A"].width = 20
+            hide_cols = []
             for c in df.columns:
                 ws.cell(row=2, column=col, value=SHORT.get(str(c), str(c))[:14])
                 for i, v in enumerate(df[c].tolist(), start=4):
@@ -617,7 +634,8 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
             for cell in row:
                 cell.font = Font(size=8, bold=False)
                 cell.alignment = Alignment(horizontal="center", vertical="center")
-        ws.freeze_panes = "B4"
+        ws.column_dimensions["A"].width = 2
+        ws.freeze_panes = "C4"
         if master_layout and name in HIDDEN:
             ws.sheet_state = "hidden"
 
@@ -676,7 +694,7 @@ def summary_text(sig: pd.DataFrame, div: pd.DataFrame, dates) -> str:
     last = cols[-1]
 
     s = sig[last]
-    lines = [f"NSE F&O buildup - {dates[-1]:%d-%b-%Y}  (D{len(cols)} of {len(cols)})", ""]
+    lines = [f"NSE F&O buildup - {dates[-1]:%d.%m.%y}  (D{len(cols)} of {len(cols)})", ""]
     for code in ("LB", "SB", "SC", "LU"):
         names = list(s[s == code].index)
         lines.append(f"{code} {SIGNAL_MEANING[code]}: {len(names)}")
@@ -686,12 +704,12 @@ def summary_text(sig: pd.DataFrame, div: pd.DataFrame, dates) -> str:
     d = div[f"{last}_div%"].dropna().sort_values(ascending=False).head(8)
     if len(d):
         lines.append("Widest futures-vs-spot gaps: "
-                     + ", ".join(f"{k} {v:.2f}%" for k, v in d.items()))
+                     + ", ".join(f"{k} {v*100:.2f}%" for k, v in d.items()))
     return "\n".join(lines)
 
 
 def inference_text(cash_sheet, fut_sheet, op_sheet, sig, cols) -> str:
-    """The reading of the sheets: biggest OI moves, delivery, PCR extremes."""
+    """The reading of the sheets: biggest OI moves and delivery extremes."""
     last = cols[-1]
     lines = []
     oi_col, px_col = f"OIchg%_{last}", f"PxChg%_{last}"
@@ -702,7 +720,7 @@ def inference_text(cash_sheet, fut_sheet, op_sheet, sig, cols) -> str:
         for sym, v in big.items():
             s = sig.get(last, pd.Series(dtype=object)).get(sym, "")
             px = fut_sheet[px_col].get(sym) if px_col in fut_sheet.columns else None
-            parts.append(f"{sym} {v:+.1f}%" + (f" px{px:+.1f}%" if pd.notna(px) else "")
+            parts.append(f"{sym} {v*100:+.1f}%" + (f" px{px*100:+.1f}%" if pd.notna(px) else "")
                          + (f" {s}" if s else ""))
         lines.append("Largest OI moves: " + "; ".join(parts))
 
@@ -722,13 +740,6 @@ def inference_text(cash_sheet, fut_sheet, op_sheet, sig, cols) -> str:
                 lines.append("Sector read: " + ", ".join(
                     f"{k} {v}" for k, v in counts.items()))
 
-    pcr = op_sheet.get(f"PCR_{last}")
-    if pcr is not None:
-        p = pcr.dropna()
-        if len(p):
-            lines.append(f"PCR: lowest {p.idxmin()} {p.min():.2f}, "
-                         f"highest {p.idxmax()} {p.max():.2f}, "
-                         f"median {p.median():.2f}")
     return "\n".join(lines)
 
 
