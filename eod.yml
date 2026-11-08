@@ -1,0 +1,41 @@
+name: NSE EOD F&O to Telegram
+
+# 19:40 IST = 14:10 UTC. NSE usually publishes the UDiFF bhavcopy by ~18:30-19:00 IST.
+# The job waits up to 25 minutes for a late file, so one run is normally enough.
+on:
+  schedule:
+    - cron: "10 14 * * 1-5"
+  workflow_dispatch:          # lets you re-run by hand from the Actions tab
+
+jobs:
+  eod:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Pull NSE EOD, compute sheets, deliver to Telegram
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FNO_THRESHOLD: "0.08"      # OI-change gate for LB/SB/SC/LU (0.08 = 8%)
+        run: python fno_eod.py --days 20 --wait 25 --telegram --out out
+
+      # Optional: keep the day's files as a 7-day artifact (no repo storage used).
+      # Delete this block if you want a strictly zero-storage setup.
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fno-eod
+          path: out/
+          retention-days: 7

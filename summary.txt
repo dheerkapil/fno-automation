@@ -1,0 +1,14 @@
+NSE F&O buildup - 06-Nov-2026  (D20 of 20)
+
+LB Long buildup   (price up, OI up): 3
+   HINDALCO, KARURVYSYA, NAVINFLUOR
+
+SB Short buildup  (price down, OI up): 6
+   ASTRAL, BOSCHLTD, BRITANNIA, COROMANDEL, DATAPATTNS, SYRMA
+
+SC Short covering (price up, OI down): 1
+   KALYANKJIL
+
+LU Long unwinding (price down, OI down): 0
+
+Widest futures-vs-spot gaps: PAGEIND 1.38%, SBILIFE 1.26%, VMM 1.14%, PFC 1.14%, HINDUNILVR 0.95%, DABUR 0.95%, SYRMA 0.93%, AMBER 0.77%
