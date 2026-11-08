@@ -25,6 +25,9 @@ jobs:
 
       - name: Pull NSE EOD, compute sheets, deliver to Telegram
         env:
+          # TELEGRAM_BOT_TOKEN is the name used in the other repos on this account;
+          # TELEGRAM_TOKEN is still honoured as a fallback by the script.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FNO_THRESHOLD: "0.08"      # OI-change gate for LB/SB/SC/LU (0.08 = 8%)
@@ -45,9 +48,10 @@ jobs:
       - name: Notify failure
         if: failure()
         env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN:-$TELEGRAM_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="NSE EOD run failed - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
