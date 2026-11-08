@@ -300,7 +300,7 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
     for c in cols:
         fa[f"OIperTrade_{c}"] = per_trade[c]
     fa["OIperTrade_20D_avg"] = per_trade.mean(axis=1)      # the master's BP column
-    out["fut_alys_data"] = fa.round(2).sort_index()
+    out["fut_alys_data"] = fa.round(2).sort_index().rename_axis("SYMBOL")
     # the master's cash sheet lists the F&O universe, not all ~2,800 cash symbols
     out["cash_alys_fno"] = ca.loc[ca.index.intersection(price.index)].round(2).sort_index()
 
@@ -329,7 +329,7 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
             oa[f"PE_lots_{c}"] = pe[c]
         for c in cols:
             oa[f"PCR_{c}"] = (pe[c] / ce[c].replace(0, pd.NA))
-        out["op_alys_data"] = oa.round(2).sort_index()
+        out["op_alys_data"] = oa.round(2).sort_index().rename_axis("SYMBOL")
 
     # ---------------- buildup + divergence --------------------------------
     idx = price.index.intersection(oi_pct.index)
@@ -352,7 +352,7 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
         if spot is not None:
             div[c] = ((price.get(c) - spot) / spot).abs() * 100
     div.columns = [f"{c}_div%" for c in cols]
-    out["buildup_summary"] = sig.join(div.round(2)).sort_index()
+    out["buildup_summary"] = sig.join(div.round(2)).sort_index().rename_axis("SYMBOL")
 
     # ---------------- one-stock panel + normalised twin -------------------
     focus = pick_focus(sig, oi_pct, cols)
@@ -434,7 +434,20 @@ def pick_focus(sig, oi_pct, cols):
 # --------------------------------------------------------------------------- #
 # render
 # --------------------------------------------------------------------------- #
-def write_xlsx(out: dict, path: str):
+SUPPORT_COLS = {"min_price", "max_price", "min_vol", "max_vol", "min_deliv", "max_deliv",
+                "min_qtytrade", "max_qtytrade", "deliv%_20D", "qty/trade_20D",
+                "lot", "OIperTrade_20D_avg", "min", "max"}
+
+
+def _day_index(name: str):
+    """D7 out of 'Close_D7' / 'OIchg%_D7' / 'D7' / 'D7_div%'."""
+    for tok in name.replace("_div%", "").split("_"):
+        if tok.startswith("D") and tok[1:].isdigit():
+            return int(tok[1:])
+    return None
+
+
+def write_xlsx(out: dict, path: str, show_days: int = 8, master_layout: bool = True):
     focus = out.pop("_focus", None)
     order = ["general", "cash_alys_fno", "fut_alys_data", "op_alys_data",
              "buildup_summary", "stock_specific_data", "normalized_data"]
@@ -461,13 +474,55 @@ def write_xlsx(out: dict, path: str):
                 if isinstance(cell.value, str) and cell.value in SIGNAL_COLORS:
                     cell.fill = PatternFill("solid", fgColor=SIGNAL_COLORS[cell.value])
                     cell.alignment = Alignment(horizontal="center")
-        # three-colour scale over the numeric grid, like the master's colour scales
-        if ws.title in ("cash_alys_fno", "fut_alys_data", "op_alys_data") and ws.max_column > 4:
-            rng = f"B2:{get_column_letter(ws.max_column)}{ws.max_row}"
-            ws.conditional_formatting.add(rng, ColorScaleRule(
-                start_type="min", start_color="63BE7B",
-                mid_type="percentile", mid_value=50, mid_color="FFEB84",
-                end_type="max", end_color="F8696B"))
+        # ---- presentation: hide support columns and the older sessions -----
+        headers = [c.value for c in ws[1]]
+        if master_layout:
+            for idx, name in enumerate(headers, start=1):
+                if not isinstance(name, str):
+                    continue
+                di = _day_index(name)
+                hide = False
+                if name in SUPPORT_COLS:
+                    hide = True                     # min/max/aggregate = support
+                elif di is not None and ws.title in ("cash_alys_fno", "fut_alys_data",
+                                                     "op_alys_data"):
+                    hide = di <= 20 - show_days     # older sessions stay, hidden
+                elif di is not None and ws.title == "buildup_summary":
+                    # the signal grid stays whole; only the older divergence
+                    # columns fold away, as in the master
+                    hide = name.endswith("_div%") and di <= 20 - show_days
+                if hide:
+                    ws.column_dimensions[get_column_letter(idx)].hidden = True
+
+        # ---- colour scales, one per day column (master's rule shape) --------
+        if ws.title in ("cash_alys_fno", "fut_alys_data", "op_alys_data"):
+            for idx, name in enumerate(headers, start=1):
+                if not isinstance(name, str) or _day_index(name) is None:
+                    continue
+                col = get_column_letter(idx)
+                ws.conditional_formatting.add(
+                    f"{col}2:{col}{ws.max_row}",
+                    ColorScaleRule(start_type="min", start_color="F8696B",
+                                   mid_type="percentile", mid_value=50, mid_color="FFEB84",
+                                   end_type="max", end_color="63BE7B"))
+        if ws.title == "buildup_summary":
+            for idx, name in enumerate(headers, start=1):
+                if isinstance(name, str) and name.endswith("_div%"):
+                    col = get_column_letter(idx)
+                    ws.conditional_formatting.add(
+                        f"{col}2:{col}{ws.max_row}",
+                        ColorScaleRule(start_type="min", start_color="63BE7B",
+                                       mid_type="percentile", mid_value=50,
+                                       mid_color="FFEB84", end_type="max",
+                                       end_color="F8696B"))
+        # one scale per metric row on the single-stock panels (master: E4:XFD4)
+        if ws.title in ("stock_specific_data", "normalized_data") and ws.max_column > 2:
+            for r in range(2, ws.max_row + 1):
+                ws.conditional_formatting.add(
+                    f"B{r}:{get_column_letter(ws.max_column)}{r}",
+                    ColorScaleRule(start_type="min", start_color="F8696B",
+                                   mid_type="percentile", mid_value=50, mid_color="FFEB84",
+                                   end_type="max", end_color="63BE7B"))
 
     # line chart of the normalised panel, the master's "Plotted Data"
     if "normalized_data" in wb.sheetnames:
@@ -627,6 +682,11 @@ def main():
     ap.add_argument("--days", type=int, default=20, help="window length (default 20)")
     ap.add_argument("--out", default="out", help="output directory")
     ap.add_argument("--telegram", action="store_true", help="deliver to Telegram")
+    ap.add_argument("--show-days", type=int, default=8,
+                    help="how many of the 20 sessions stay visible; older ones are "
+                         "kept in the sheet but hidden (default 8, like the master)")
+    ap.add_argument("--full-layout", action="store_true",
+                    help="show every column instead of the master's hidden-column layout")
     ap.add_argument("--raw", action="store_true",
                     help="also include cash/futures/options source rows for the "
                          "latest session, as the master's hidden data sheets")
@@ -662,7 +722,7 @@ def main():
     out = sheets(cash, fut, opt, dates, THRESHOLD, raw=args.raw)
 
     xlsx = os.path.join(args.out, f"fno_eod_{dates[-1]:%Y%m%d}.xlsx")
-    write_xlsx(out, xlsx)
+    write_xlsx(out, xlsx, show_days=args.show_days, master_layout=not args.full_layout)
     sig = out["buildup_summary"]
     div_cols = [c for c in sig.columns if c.endswith("_div%")]
     div = sig[div_cols]
