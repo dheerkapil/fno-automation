@@ -515,10 +515,10 @@ def main():
     print(f"\n{len(files)} files, {total/1024:.0f} KB total -> {args.out}/")
 
     if args.telegram:
-        token = os.environ.get("TELEGRAM_TOKEN")
+        token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
         chat = os.environ.get("TELEGRAM_CHAT_ID")
         if not token or not chat:
-            sys.exit("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set")
+            sys.exit("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set")
         tg_send(token, chat, text)
         for f in files:
             tg_doc(token, chat, f)
