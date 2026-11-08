@@ -49,7 +49,10 @@ URL_IND = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv
 
 CACHE = os.environ.get("FNO_CACHE", "cache")
 THRESHOLD = float(os.environ.get("FNO_THRESHOLD", "0.08"))   # 8% OI change
-SIGNAL_COLORS = {"LB": "C6EFCE", "SB": "FFC7CE", "SC": "BDD7EE", "LU": "FFE699"}
+# exact fills lifted from the master's conditional formats (dxf 5,6,7,8)
+SIGNAL_COLORS = {"LB": "00B050", "SB": "FF0000", "SC": "92D050", "LU": "5B9BD5"}
+HILITE_BLUE = "DAE3F3"      # theme accent5, tint 0.80 - day above window average
+HILITE_GREY = "DBDBDB"      # theme accent3, tint 0.60 - both measures above
 SIGNAL_MEANING = {
     "LB": "Long buildup   (price up, OI up)",
     "SB": "Short buildup  (price down, OI up)",
@@ -354,6 +357,19 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
     div.columns = [f"{c}_div%" for c in cols]
     out["buildup_summary"] = sig.join(div.round(2)).sort_index().rename_axis("SYMBOL")
 
+    # ---------------- nifty_delivery (hidden support sheet) ---------------
+    ind_map = industry_map()
+    n500 = [s_ for s_ in px.index if s_ in ind_map]
+    nd = pd.DataFrame(index=sorted(n500))
+    for c in cols:
+        nd[f"Deliv_{c}"] = delq.reindex(nd.index)[c]
+    for c in cols:
+        nd[f"Vol_{c}"] = qty.reindex(nd.index)[c]
+    for c in cols:
+        nd[f"Deliv%_{c}"] = (delq.reindex(nd.index)[c]
+                             / qty.reindex(nd.index)[c].replace(0, pd.NA) * 100)
+    out["nifty_delivery"] = nd.round(2)
+
     # ---------------- one-stock panel + normalised twin -------------------
     focus = pick_focus(sig, oi_pct, cols)
 
@@ -447,10 +463,12 @@ def _day_index(name: str):
     return None
 
 
-def write_xlsx(out: dict, path: str, show_days: int = 8, master_layout: bool = True):
+def write_xlsx(out: dict, path: str, show_days: int = 10, master_layout: bool = True):
     focus = out.pop("_focus", None)
     order = ["general", "cash_alys_fno", "fut_alys_data", "op_alys_data",
-             "buildup_summary", "stock_specific_data", "normalized_data"]
+             "buildup_summary", "nifty_delivery", "stock_specific_data",
+             "normalized_data"]
+    HIDDEN_SHEETS = {"general", "nifty_delivery", "normalized_data"}
     with pd.ExcelWriter(path, engine="openpyxl") as xl:
         for name in [n for n in order if n in out] + [n for n in out if n not in order]:
             if name.startswith("_"):
@@ -459,7 +477,8 @@ def write_xlsx(out: dict, path: str, show_days: int = 8, master_layout: bool = T
     # light styling: signal colours, colour scales, freeze panes, widths
     from openpyxl import load_workbook
     from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.formatting.rule import ColorScaleRule
+    from openpyxl.formatting.rule import ColorScaleRule, FormulaRule
+    from openpyxl.styles import Border, Side
     from openpyxl.chart import LineChart, Reference
     from openpyxl.utils import get_column_letter
     wb = load_workbook(path)
@@ -476,6 +495,11 @@ def write_xlsx(out: dict, path: str, show_days: int = 8, master_layout: bool = T
                     cell.alignment = Alignment(horizontal="center")
         # ---- presentation: hide support columns and the older sessions -----
         headers = [c.value for c in ws[1]]
+        col_of = {}
+        for idx, name in enumerate(headers, start=1):
+            if isinstance(name, str):
+                col_of[name] = get_column_letter(idx)
+
         if master_layout:
             for idx, name in enumerate(headers, start=1):
                 if not isinstance(name, str):
@@ -483,19 +507,19 @@ def write_xlsx(out: dict, path: str, show_days: int = 8, master_layout: bool = T
                 di = _day_index(name)
                 hide = False
                 if name in SUPPORT_COLS:
-                    hide = True                     # min/max/aggregate = support
+                    hide = True                        # min/max/aggregate = support
+                elif ws.title == "fut_alys_data" and name.startswith("PxChg%"):
+                    hide = True                        # master hides this block whole
                 elif di is not None and ws.title in ("cash_alys_fno", "fut_alys_data",
-                                                     "op_alys_data"):
-                    hide = di <= 20 - show_days     # older sessions stay, hidden
+                                                     "op_alys_data", "nifty_delivery"):
+                    hide = di <= 20 - show_days        # older sessions stay, hidden
                 elif di is not None and ws.title == "buildup_summary":
-                    # the signal grid stays whole; only the older divergence
-                    # columns fold away, as in the master
                     hide = name.endswith("_div%") and di <= 20 - show_days
                 if hide:
                     ws.column_dimensions[get_column_letter(idx)].hidden = True
 
         # ---- colour scales, one per day column (master's rule shape) --------
-        if ws.title in ("cash_alys_fno", "fut_alys_data", "op_alys_data"):
+        if ws.title in ("cash_alys_fno", "fut_alys_data", "op_alys_data", "nifty_delivery"):
             for idx, name in enumerate(headers, start=1):
                 if not isinstance(name, str) or _day_index(name) is None:
                     continue
@@ -515,6 +539,65 @@ def write_xlsx(out: dict, path: str, show_days: int = 8, master_layout: bool = T
                                        mid_type="percentile", mid_value=50,
                                        mid_color="FFEB84", end_type="max",
                                        end_color="F8696B"))
+
+        # ---- signal fills (master dxf 5-8: LB green, SB red, SC lime, LU blue)
+        if ws.title == "buildup_summary":
+            last = ws.max_row
+            for code, rgb in SIGNAL_COLORS.items():
+                rng = None
+                day_cols = [col_of[h] for h in headers
+                            if isinstance(h, str) and _day_index(h) is not None
+                            and not h.endswith("_div%")]
+                if not day_cols:
+                    continue
+                rng = f"{day_cols[0]}2:{day_cols[-1]}{last}"
+                ws.conditional_formatting.add(
+                    rng, FormulaRule(formula=[f'{day_cols[0]}2="{code}"'],
+                                     fill=PatternFill("solid", bgColor=rgb),
+                                     stopIfTrue=False))
+
+        # ---- day-above-average highlights (master's cash rules) -------------
+        if ws.title == "cash_alys_fno" and "deliv%_20D" in col_of:
+            agg_d = col_of["deliv%_20D"]
+            agg_q = col_of.get("qty/trade_20D")
+            for h in headers:
+                if not isinstance(h, str) or not h.startswith("Deliv%_"):
+                    continue
+                dcol = col_of[h]
+                ws.conditional_formatting.add(
+                    f"{dcol}2:{dcol}{ws.max_row}",
+                    FormulaRule(formula=[f"AND({dcol}2<>\"\",{dcol}2>${agg_d}2)"],
+                                fill=PatternFill("solid", bgColor=HILITE_BLUE)))
+                if agg_q:
+                    qcol = col_of.get(h.replace("Deliv%_", "Qty/Trade_"))
+                    if qcol:
+                        ws.conditional_formatting.add(
+                            f"{dcol}2:{dcol}{ws.max_row}",
+                            FormulaRule(formula=[f"AND({dcol}2>${agg_d}2,{qcol}2>${agg_q}2)"],
+                                        fill=PatternFill("solid", bgColor=HILITE_GREY)))
+            for h in headers:
+                if not isinstance(h, str) or not h.startswith("Qty/Trade_") or not agg_q:
+                    continue
+                qcol = col_of[h]
+                ws.conditional_formatting.add(
+                    f"{qcol}2:{qcol}{ws.max_row}",
+                    FormulaRule(formula=[f"AND({qcol}2<>\"\",{qcol}2>${agg_q}2)"],
+                                fill=PatternFill("solid", bgColor=HILITE_BLUE)))
+
+        # ---- OI intensity box (master's fut_alys_data rule) -----------------
+        if ws.title == "fut_alys_data" and "OIperTrade_20D_avg" in col_of:
+            per_trade_cols = [col_of[h] for h in headers
+                              if isinstance(h, str) and h.startswith("OIperTrade_")
+                              and not h.endswith("_avg")]
+            oi_cols = [col_of[h] for h in headers
+                       if isinstance(h, str) and h.startswith("OIchg%_")]
+            if per_trade_cols and oi_cols:
+                ws.conditional_formatting.add(
+                    f"{oi_cols[0]}2:{oi_cols[-1]}{ws.max_row}",
+                    FormulaRule(formula=[f"${per_trade_cols[0]}2>${col_of['OIperTrade_20D_avg']}2"],
+                                border=Border(left=Side(style="thin"), right=Side(style="thin"),
+                                              top=Side(style="thin"), bottom=Side(style="thin"))))
+
         # one scale per metric row on the single-stock panels (master: E4:XFD4)
         if ws.title in ("stock_specific_data", "normalized_data") and ws.max_column > 2:
             for r in range(2, ws.max_row + 1):
@@ -523,6 +606,9 @@ def write_xlsx(out: dict, path: str, show_days: int = 8, master_layout: bool = T
                     ColorScaleRule(start_type="min", start_color="F8696B",
                                    mid_type="percentile", mid_value=50, mid_color="FFEB84",
                                    end_type="max", end_color="63BE7B"))
+
+        if master_layout and ws.title in HIDDEN_SHEETS:
+            ws.sheet_state = "hidden"
 
     # line chart of the normalised panel, the master's "Plotted Data"
     if "normalized_data" in wb.sheetnames:
@@ -682,7 +768,7 @@ def main():
     ap.add_argument("--days", type=int, default=20, help="window length (default 20)")
     ap.add_argument("--out", default="out", help="output directory")
     ap.add_argument("--telegram", action="store_true", help="deliver to Telegram")
-    ap.add_argument("--show-days", type=int, default=8,
+    ap.add_argument("--show-days", type=int, default=10,
                     help="how many of the 20 sessions stay visible; older ones are "
                          "kept in the sheet but hidden (default 8, like the master)")
     ap.add_argument("--full-layout", action="store_true",
