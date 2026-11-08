@@ -7,7 +7,7 @@ permissions:
 
 on:
   schedule:
-    - cron: "10 14 * * 1-5"
+    - cron: "10 14 * * *"     # daily - the script skips days with no new session
   workflow_dispatch:          # lets you re-run by hand from the Actions tab
 
 jobs:
@@ -34,7 +34,7 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FNO_THRESHOLD: "0.08"      # OI-change gate for LB/SB/SC/LU (0.08 = 8%)
-        run: python fno_eod.py --days 20 --wait 20 --telegram --out out
+        run: python fno_eod.py --days 20 --wait 20 --telegram --skip-if-sent --out out
 
       # Keep the long-run history current: adds data/history/<date>.csv.gz
       - name: Update history
