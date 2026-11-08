@@ -138,12 +138,11 @@ def trading_dates(end: dt.date, n: int) -> list[dt.date]:
     guard = 0
     while len(out) < n and guard < n * 3 + 15:
         guard += 1
-        if d.weekday() < 5:                      # skip Sat/Sun without a request
-            # a session counts only if BOTH cash and F&O files exist: NSE
-            # publishes no UDiFF bhavcopy for special (muhurat) sessions
-            if cached(f"sec_{d:%Y%m%d}.csv", sec_url(d)) and \
-               cached(f"fo_{d:%Y%m%d}.zip", fo_url(d)):
-                out.append(d)
+        # probe every calendar day, weekends included: muhurat sessions fall on
+        # a Sunday and publish a normal bhavcopy
+        if cached(f"sec_{d:%Y%m%d}.csv", sec_url(d)) and \
+           cached(f"fo_{d:%Y%m%d}.zip", fo_url(d)):
+            out.append(d)
         d -= dt.timedelta(days=1)
     return sorted(out)
 
@@ -397,13 +396,14 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
         src["CE OI lots"] = ce
         src["PE OI lots"] = pe
     syms = sorted(price.index)      # F&O universe only - keeps the sheet small
-    wide = pd.DataFrame(index=syms)
+    data = {}
     for mname, frame in src.items():
         if mname in ("CE OI lots", "PE OI lots"):
             frame = frame.round(0).astype("Int64")
         for c in cols:
-            wide[f"{mname}|{c}"] = (frame.reindex(syms)[c] if c in frame.columns
-                                    else pd.NA)
+            data[f"{mname}|{c}"] = (frame.reindex(syms)[c] if c in frame.columns
+                                    else pd.Series(pd.NA, index=syms))
+    wide = pd.DataFrame(data, index=syms)
     out["panel_data"] = _round_frame(wide)
 
     panel = pd.DataFrame({name: (series.reindex(cols) if isinstance(series, pd.Series)
