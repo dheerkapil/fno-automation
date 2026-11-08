@@ -442,17 +442,35 @@ def summary_text(sig: pd.DataFrame, div: pd.DataFrame, dates) -> str:
 # --------------------------------------------------------------------------- #
 # telegram
 # --------------------------------------------------------------------------- #
-def tg_send(token: str, chat: str, text: str):
+def tg_check(r, what: str) -> dict:
+    """A 401/400 from Telegram must fail the run, not pass silently."""
+    try:
+        body = r.json()
+    except Exception:                                   # noqa: BLE001
+        body = {}
+    if r.status_code != 200 or not body.get("ok"):
+        raise RuntimeError(f"telegram {what} failed: HTTP {r.status_code} "
+                           f"{body.get('description', r.text[:200])}")
+    return body
+
+
+def tg_send(token: str, chat: str, text: str) -> int:
+    sent = 0
     for chunk in [text[i:i + 3900] for i in range(0, len(text), 3900)]:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      data={"chat_id": chat, "text": chunk}, timeout=60)
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          data={"chat_id": chat, "text": chunk}, timeout=60)
+        tg_check(r, "sendMessage")
+        sent += 1
+    return sent
 
 
-def tg_doc(token: str, chat: str, path: str, caption: str = ""):
+def tg_doc(token: str, chat: str, path: str, caption: str = "") -> int:
     with open(path, "rb") as fh:
-        requests.post(f"https://api.telegram.org/bot{token}/sendDocument",
-                      data={"chat_id": chat, "caption": caption[:1000]},
-                      files={"document": (os.path.basename(path), fh)}, timeout=180)
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendDocument",
+                          data={"chat_id": chat, "caption": caption[:1000]},
+                          files={"document": (os.path.basename(path), fh)}, timeout=180)
+    tg_check(r, "sendDocument")
+    return 1
 
 
 # --------------------------------------------------------------------------- #
@@ -519,10 +537,9 @@ def main():
         chat = os.environ.get("TELEGRAM_CHAT_ID")
         if not token or not chat:
             sys.exit("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set")
-        tg_send(token, chat, text)
-        for f in files:
-            tg_doc(token, chat, f)
-        print("sent to Telegram")
+        msgs = tg_send(token, chat, text)
+        docs = sum(tg_doc(token, chat, f) for f in files)
+        print(f"sent to Telegram: {msgs} message(s), {docs} document(s), all ok")
 
     if not args.keep_cache:
         shutil.rmtree(CACHE, ignore_errors=True)
