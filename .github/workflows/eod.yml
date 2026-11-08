@@ -2,6 +2,9 @@ name: NSE EOD F&O to Telegram
 
 # 19:40 IST = 14:10 UTC. NSE usually publishes the UDiFF bhavcopy by ~18:30-19:00 IST.
 # The job waits up to 20 minutes for a late file, so one run is normally enough.
+permissions:
+  contents: write          # lets the job append the history shard and push it
+
 on:
   schedule:
     - cron: "10 14 * * 1-5"
@@ -32,6 +35,20 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FNO_THRESHOLD: "0.08"      # OI-change gate for LB/SB/SC/LU (0.08 = 8%)
         run: python fno_eod.py --days 20 --wait 20 --telegram --out out
+
+      # Keep the long-run history current: adds data/history/<date>.csv.gz
+      - name: Update history
+        if: always()
+        run: python backfill.py --since-last
+
+      - name: Commit history shard
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/history 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "History: $(date -u +%F)"
+          git push || true
 
       # Optional: keep the day's files as a 7-day artifact (no repo storage used).
       # Delete this block if you want a strictly zero-storage setup.
