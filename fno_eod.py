@@ -51,9 +51,11 @@ URL_IND = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv
 CACHE = os.environ.get("FNO_CACHE", "cache")
 THRESHOLD = float(os.environ.get("FNO_THRESHOLD", "0.08"))   # 8% OI change
 # exact fills lifted from the master's conditional formats (dxf 5,6,7,8)
-SIGNAL_COLORS = {"LB": "00B050", "SB": "FF0000", "SC": "92D050", "LU": "5B9BD5"}
-HILITE_BLUE = "DAE3F3"      # theme accent5, tint 0.80 - day above window average
-HILITE_GREY = "DBDBDB"      # theme accent3, tint 0.60 - both measures above
+SIGNAL_COLORS = {"LB": "00B050", "SB": "FF0000", "SC": "92D050", "LU": "ED7D31"}
+# theme indices in the master resolve to accent2 / accent6 / accent4, not the
+# blues I assumed: LU is orange, and the two highlights are pale green and gold
+HILITE_ABOVE = "E2F0D9"     # theme accent6 (70AD47), tint 0.80 - above average
+HILITE_BOTH = "FFE699"      # theme accent4 (FFC000), tint 0.60 - both above
 SIGNAL_MEANING = {
     "LB": "Long buildup   (price up, OI up)",
     "SB": "Short buildup  (price down, OI up)",
@@ -576,16 +578,16 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
                                 f"{L}{first_row}:{L}{last_row}",
                                 FormulaRule(formula=[f"AND({L}{first_row}>${agd}{first_row},"
                                                      f"{Q}{first_row}>${agq}{first_row})"],
-                                            fill=PatternFill("solid", bgColor=HILITE_GREY)))
+                                            fill=PatternFill("solid", bgColor=HILITE_BOTH)))
                         ws.conditional_formatting.add(
                             f"{L}{first_row}:{L}{last_row}",
                             FormulaRule(formula=[f"{L}{first_row}>${agd}{first_row}"],
-                                        fill=PatternFill("solid", bgColor=HILITE_BLUE)))
+                                        fill=PatternFill("solid", bgColor=HILITE_ABOVE)))
                     elif str(c).startswith("Qty/Trade"):
                         ws.conditional_formatting.add(
                             f"{L}{first_row}:{L}{last_row}",
                             FormulaRule(formula=[f"{L}{first_row}>${agq}{first_row}"],
-                                        fill=PatternFill("solid", bgColor=HILITE_BLUE)))
+                                        fill=PatternFill("solid", bgColor=HILITE_ABOVE)))
 
             # futures: thin box where OI per contract beats its own average
             if name == "fut_alys_data" and "OIperTrade_20D_avg" in colmap:
