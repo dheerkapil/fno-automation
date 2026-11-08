@@ -278,21 +278,27 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
     # as 4.02% (its cash sheet is the opposite - 38.24 means 38.24%)
     fut["px_chg%"] = (fut.groupby(["TckrSymb", "XpryDt"], group_keys=False)["SttlmPric"]
                          .pct_change(fill_method=None))
-    near = fut.loc[fut.groupby(["TckrSymb", "day"])["XpryDt"].idxmin()]
+    # the master pins ONE expiry per symbol for the whole window - the nearest
+    # expiry as of the last session - rather than rolling day by day
+    last_day = cols[-1]
+    pinned = (fut[fut["day"] == last_day].groupby("TckrSymb")["XpryDt"].min()
+                 .rename("pin"))
+    fut = fut.merge(pinned, left_on="TckrSymb", right_index=True, how="left")
+    near = fut[fut["XpryDt"] == fut["pin"]]
     price = near.pivot_table(index="TckrSymb", columns="day", values="SttlmPric", aggfunc="last").reindex(columns=cols)
     px_pct = near.pivot_table(index="TckrSymb", columns="day", values="px_chg%", aggfunc="last").reindex(columns=cols)
     lot = near.pivot_table(index="TckrSymb", columns="day", values="NewBrdLotQty", aggfunc="last").reindex(columns=cols)
 
     agg = fut.groupby(["TckrSymb", "day"]).agg(
         oi=("OpnIntrst", "sum"), coi=("ChngInOpnIntrst", "sum"),
-        trades=("TtlNbOfTxsExctd", "sum")).reset_index()
+        trades=("TtlNbOfTxsExctd", "sum"), vol=("TtlTradgVol", "sum")).reset_index()
     agg["oi_pct"] = agg["coi"] / (agg["oi"] - agg["coi"]).replace(0, pd.NA)
-    agg["ct_per_trade"] = agg["coi"] / agg["trades"].replace(0, pd.NA)
+    # the master's ABS(CHG_IN_OI / CONTRACTS): absolute, per contract traded
+    agg["ct_per_trade"] = agg["coi"].abs() / agg["vol"].replace(0, pd.NA)
     oi = agg.pivot_table(index="TckrSymb", columns="day", values="oi", aggfunc="last").reindex(columns=cols)
     oi_pct = agg.pivot_table(index="TckrSymb", columns="day", values="oi_pct", aggfunc="last").reindex(columns=cols)
-    per_trade = (agg.pivot_table(index="TckrSymb", columns="day", values="ct_per_trade",
-                                 aggfunc="last").reindex(columns=cols)
-                    .div(lot.replace(0, pd.NA)))
+    per_trade = agg.pivot_table(index="TckrSymb", columns="day", values="ct_per_trade",
+                                aggfunc="last").reindex(columns=cols)
 
     # column order copied from the master: price, OI % change, futures TQ/NT
     # (with its average), cumulative OI, then price % change
@@ -312,7 +318,7 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
         fa[f"PxChg%_{c}"] = px_pct[c]
     fa["lot"] = lot[cols[-1]]        # parked last so the five blocks land on
                                      # the master's F / AA / AV / BR / CN
-    out["fut_alys_data"] = fa.round(2).sort_index().rename_axis("SYMBOL")
+    out["fut_alys_data"] = _round_frame(fa).sort_index().rename_axis("SYMBOL")
     # the master's cash sheet lists the F&O universe, not all ~2,800 cash symbols
     out["cash_alys_fno"] = ca.loc[ca.index.intersection(price.index)].round(2).sort_index()
 
@@ -323,16 +329,13 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
     op = op.dropna(subset=["oi_lots"])
     ce = pe = None
     if not op.empty:
-        per_exp = (op.groupby(["TckrSymb", "day", "XpryDt", "OptnTp"])["oi_lots"]
-                     .sum().reset_index())
-        tot = per_exp.groupby(["TckrSymb", "day", "XpryDt"])["oi_lots"].sum().reset_index()
-        dom = tot.loc[tot.groupby(["TckrSymb", "day"])["oi_lots"].idxmax()]
-        dom = dom.merge(per_exp, on=["TckrSymb", "day", "XpryDt"], suffixes=("_tot", ""))
-        ce = (dom[dom["OptnTp"] == "CE"].pivot_table(index="TckrSymb", columns="day",
-                                                     values="oi_lots", aggfunc="sum")
+        # every expiry summed - the master's SUMIFS filters symbol, date and
+        # option type only, never expiry
+        ce = (op[op["OptnTp"] == "CE"].pivot_table(index="TckrSymb", columns="day",
+                                                   values="oi_lots", aggfunc="sum")
               .reindex(columns=cols))
-        pe = (dom[dom["OptnTp"] == "PE"].pivot_table(index="TckrSymb", columns="day",
-                                                     values="oi_lots", aggfunc="sum")
+        pe = (op[op["OptnTp"] == "PE"].pivot_table(index="TckrSymb", columns="day",
+                                                   values="oi_lots", aggfunc="sum")
               .reindex(columns=cols))
         oa = pd.DataFrame(index=ce.index.union(pe.index))
         # CE and PE side by side for each day, the master's layout - not two
@@ -363,7 +366,7 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
         if spot is not None:
             div[c] = ((price.get(c) - spot) / spot).abs()
     div.columns = [f"{c}_div%" for c in cols]
-    out["buildup_summary"] = sig.join(div.round(2)).sort_index().rename_axis("SYMBOL")
+    out["buildup_summary"] = _round_frame(sig.join(div)).sort_index().rename_axis("SYMBOL")
 
     # ---------------- one-stock panel + normalised twin -------------------
     focus = pick_focus(sig, oi_pct, cols)
@@ -383,6 +386,21 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
         metrics += [("CE OI lots", ce.loc[focus]), ("PE OI lots", pe.loc[focus])]
     if focus in sig.index:
         metrics += [("Signal", sig.loc[focus])]
+
+    # every symbol x metric x day, so the sheet's dropdown can drive INDEX/MATCH
+    src = {"Cash Price": cash_close, "Volume": qty, "Delivery%": dv,
+           "Cash Qty/Trade": qt, "Futures Price": price, "Cumulative OI": oi,
+           "OI chg %": oi_pct, "FNO TQ/NT": per_trade}
+    if ce is not None:
+        src["CE OI lots"] = ce
+        src["PE OI lots"] = pe
+    syms = sorted(price.index)      # F&O universe only - keeps the sheet small
+    wide = pd.DataFrame(index=syms)
+    for mname, frame in src.items():
+        for c in cols:
+            wide[f"{mname}|{c}"] = (frame.reindex(syms)[c] if c in frame.columns
+                                    else pd.NA)
+    out["panel_data"] = _round_frame(wide)
 
     panel = pd.DataFrame({name: (series.reindex(cols) if isinstance(series, pd.Series)
                                  else pd.Series(dtype=float))
@@ -431,6 +449,17 @@ SCALAR_SHORT = {"min_price": "min", "max_price": "max", "min_vol": "min", "max_v
 SEP_RGB = "002060"
 
 
+def _round_frame(df, frac_prefixes=("OIchg%", "PxChg%"), frac_suffixes=("_div%",)):
+    """Fractions must not go through round(2) - 0.0074 would collapse to 0.01."""
+    out = df.copy()
+    for c in out.columns:
+        if out[c].dtype.kind not in "if":      # leave the signal strings alone
+            continue
+        frac = (str(c).startswith(frac_prefixes) or str(c).endswith(frac_suffixes))
+        out[c] = out[c].round(6 if frac else 2)
+    return out
+
+
 def _day_index(name: str):
     """D7 out of 'Close_D7' / 'OIchg%_D7' / 'D7' / 'D7_div%'."""
     for tok in str(name).replace("_div%", "").split("_"):
@@ -475,8 +504,9 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
 
     out = {k: v for k, v in out.items() if not k.startswith("_")}
     order = ["cash_alys_fno", "fut_alys_data", "op_alys_data",
-             "buildup_summary", "stock_specific_data", "normalized_data"]
-    HIDDEN = {"normalized_data"}      # only because the chart reads from it
+             "buildup_summary", "stock_specific_data", "normalized_data",
+             "panel_data"]
+    HIDDEN = {"normalized_data", "panel_data"}   # chart source + selector lookup
     wb = Workbook()
     wb.remove(wb.active)
     date_lbl = {f"D{i+1}": d.strftime("%d.%m.%y") for i, d in enumerate(dates)}
@@ -501,8 +531,11 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
             col += 1
 
         if grid:
+            single_header = False
             if name == "op_alys_data":
-                groups = [("CE / PE OI (lots)", list(df.columns))]
+                cols_list = list(df.columns)
+                groups = [(f"D{i+1}", cols_list[i*2:i*2+2]) for i in range(len(cols_list)//2)]
+                single_header = True
             else:
                 groups = _plan(df)
             for gname, cols in groups:
@@ -518,6 +551,12 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
                         pair_pe = str(c).startswith("PE_lots")
                         ws.cell(row=2, column=col, value="" if pair_pe else f"D{d}")
                         ws.cell(row=3, column=col, value="" if pair_pe else date_lbl.get(f"D{d}", ""))
+                        if pair_pe:
+                            # label and date span the CE+PE pair
+                            ws.merge_cells(start_row=2, start_column=col - 1,
+                                           end_row=2, end_column=col)
+                            ws.merge_cells(start_row=3, start_column=col - 1,
+                                           end_row=3, end_column=col)
                         # only these two sheets fold the older sessions away;
                         # options, buildup and nifty_delivery show all 20 days
                         if master_layout and d <= 20 - show_days and \
@@ -538,9 +577,15 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
                     col += 1
                 last = col - 1
                 if last >= first:
-                    ws.merge_cells(start_row=1, start_column=first, end_row=1, end_column=last)
-                    ws.cell(row=1, column=first, value=gname)
+                    if not single_header:
+                        ws.merge_cells(start_row=1, start_column=first, end_row=1, end_column=last)
+                        ws.cell(row=1, column=first, value=gname)
                     block_spans.append((gname, first, last))
+            if name == "op_alys_data" and block_spans:
+                f0, l0 = block_spans[0][1], block_spans[-1][2]
+                ws.merge_cells(start_row=1, start_column=f0, end_row=1, end_column=l0)
+                ws.cell(row=1, column=f0, value="CE / PE OI (lots)")
+
             # per-row colour scale inside each dataset - but only on the blocks
             # the master scales. Delivery % and qty/trade are NOT colour-scaled
             # there: they carry the blue/grey above-average highlight instead,
@@ -614,6 +659,44 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
                             f"{c0}4:{get_column_letter(last)}{n_rows + 3}",
                             FormulaRule(formula=[f'{c0}4="{code}"'],
                                         fill=PatternFill("solid", bgColor=rgb)))
+        elif name == "stock_specific_data" and "panel_data" in out:
+            wide = out["panel_data"]
+            syms = list(wide.index)
+            ws.column_dimensions["A"].width = 22
+            ws.cell(row=1, column=1, value="Stock")
+            ws.cell(row=1, column=2, value=str(df.index.name or syms[0]))
+            for j, c in enumerate(df.columns, start=2):
+                ws.cell(row=2, column=j, value=c)
+                ws.cell(row=3, column=j, value=date_lbl.get(c, ""))
+                ws.column_dimensions[get_column_letter(j)].width = 11
+            metrics = list(df.index)
+            # panel_data: symbols in column A from row 4, data from column B
+            first_sym_row, last_sym_row = 4, 4 + len(syms) - 1
+            last_data_col = get_column_letter(2 + len(wide.columns) - 1)
+            cols_index = {c: i + 1 for i, c in enumerate(wide.columns)}
+            for i, m in enumerate(metrics, start=4):
+                ws.cell(row=i, column=1, value=str(m))
+                for j, c in enumerate(df.columns, start=2):
+                    if m == "Date":
+                        ws.cell(row=i, column=j, value=df.loc[m, c])
+                        continue
+                    key = f"{m}|{c}"
+                    if key not in cols_index:
+                        continue
+                    k = cols_index[key]
+                    ws.cell(row=i, column=j,
+                            value=f"=IFERROR(INDEX(panel_data!$B${first_sym_row}:${last_data_col}${last_sym_row},"
+                                  f"MATCH($B$1,panel_data!$A${first_sym_row}:$A${last_sym_row},0),{k}),\"\")")
+                    ws.cell(row=i, column=j).number_format = (
+                        "0.00%" if str(m) == "OI chg %" else "#,##0.##")
+            from openpyxl.worksheet.datavalidation import DataValidation
+            dv = DataValidation(type="list",
+                                formula1=f"=panel_data!$A$4:$A${4 + len(syms) - 1}",
+                                allow_blank=False, showDropDown=False)
+            ws.add_data_validation(dv)
+            dv.add("B1")
+            hide_cols = []
+
         else:
             # plain sheets: row labels in A, single header row, no blocks
             for i, v in enumerate(df.index, start=4):
@@ -645,10 +728,25 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
             for cell in row:
                 cell.font = Font(size=8, bold=False)
                 cell.alignment = Alignment(horizontal="center", vertical="center")
-        ws.column_dimensions["A"].width = 2
-        ws.freeze_panes = "C4"
+        if grid:
+            ws.column_dimensions["A"].width = 2      # hidden spacer on grid sheets
+            ws.freeze_panes = "C4"
         if master_layout and name in HIDDEN:
             ws.sheet_state = "hidden"
+
+    if "stock_specific_data" in wb.sheetnames:
+        ws = wb["stock_specific_data"]
+        if ws.max_row >= 5 and ws.max_column >= 3:
+            from openpyxl.chart import LineChart, Reference
+            ch = LineChart()
+            ch.title = "Selected stock - 20 sessions"
+            ch.height, ch.width = 10, 26
+            data = Reference(ws, min_col=2, max_col=ws.max_column,
+                             min_row=4, max_row=ws.max_row)
+            cats = Reference(ws, min_col=2, max_col=ws.max_column, min_row=3, max_row=3)
+            ch.add_data(data, from_rows=True, titles_from_data=True)
+            ch.set_categories(cats)
+            ws.add_chart(ch, f"A{ws.max_row + 3}")
 
     if "normalized_data" in wb.sheetnames:
         ws = wb["normalized_data"]
