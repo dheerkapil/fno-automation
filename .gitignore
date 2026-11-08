@@ -3,3 +3,4 @@ out/
 *.pyc
 __pycache__/
 .DS_Store
+data/history.csv.gz
