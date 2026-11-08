@@ -201,88 +201,89 @@ def label(dates: list[dt.date]) -> dict:
 # the sheets
 # --------------------------------------------------------------------------- #
 def sheets(cash, fut, opt, dates, threshold):
-    """All output sheets. Every series is computed *within its own expiry* so
-    rollover days do not produce fake OI-collapse signals."""
+    """Rebuild every sheet of the master workbook, full width.
+
+    Each sheet keeps the master's shape: one row per symbol, then the D1..D20
+    grid for every measure it carried - not just a 20-day summary.
+    """
     lab = label(dates)
     cols = [f"D{i+1}" for i in range(len(dates))]
     out = {}
 
-    # ---------------- cash: delivery %, qty per trade, min/max -------------
+    # ---------------- cash -------------------------------------------------
     cash = cash[cash["date"].isin(lab)].copy()
     cash["day"] = cash["date"].map(lab)
-    px = cash.pivot_table(index="SYMBOL", columns="day", values="CLOSE_PRICE", aggfunc="last")
-    dv = cash.pivot_table(index="SYMBOL", columns="day", values="DELIV_PER", aggfunc="last")
-    qty = cash.pivot_table(index="SYMBOL", columns="day", values="TTL_TRD_QNTY", aggfunc="sum")
-    trd = cash.pivot_table(index="SYMBOL", columns="day", values="NO_OF_TRADES", aggfunc="sum")
-    px, dv, qty, trd = (df.reindex(columns=cols) for df in (px, dv, qty, trd))
+    px = cash.pivot_table(index="SYMBOL", columns="day", values="CLOSE_PRICE", aggfunc="last").reindex(columns=cols)
+    dv = cash.pivot_table(index="SYMBOL", columns="day", values="DELIV_PER", aggfunc="last").reindex(columns=cols)
+    qty = cash.pivot_table(index="SYMBOL", columns="day", values="TTL_TRD_QNTY", aggfunc="sum").reindex(columns=cols)
+    trd = cash.pivot_table(index="SYMBOL", columns="day", values="NO_OF_TRADES", aggfunc="sum").reindex(columns=cols)
+    delq = cash.pivot_table(index="SYMBOL", columns="day", values="DELIV_QTY", aggfunc="sum").reindex(columns=cols)
     qt = qty / trd.replace(0, pd.NA)
-    cash_close = px.ffill(axis=1)          # last traded close, carried forward
-
-    delq = cash.pivot_table(index="SYMBOL", columns="day", values="DELIV_QTY",
-                            aggfunc="sum").reindex(columns=cols)
+    cash_close = px.ffill(axis=1)
 
     ca = pd.DataFrame(index=px.index)
     ca["min"] = px.min(axis=1)
     ca["max"] = px.max(axis=1)
-    ca["close"] = cash_close[cols[-1]]
-    # window aggregates (sum/sum), the same definition the old workbook used in
-    # its AX and BV columns - not a mean of daily ratios
     ca["deliv%_20D"] = delq.sum(axis=1) / qty.sum(axis=1).replace(0, pd.NA) * 100
     ca["qty/trade_20D"] = qty.sum(axis=1) / trd.sum(axis=1).replace(0, pd.NA)
-    ca["turnover_cr_20D"] = (qty.sum(axis=1) * ca["close"] / 1e7).round(2)
-    out["cash_alys_fno"] = ca.round(2).sort_index()
+    for c in cols:
+        ca[f"Close_{c}"] = px[c]
+    for c in cols:
+        ca[f"Deliv%_{c}"] = dv[c]
+    for c in cols:
+        ca[f"Qty/Trade_{c}"] = qt[c]
+    # assigned after the futures universe is known (see below)
 
-    # ---------------- futures: settle, OI, OI change % ---------------------
-    # price comes from the nearest series (its own day-over-day change), while
-    # OI is aggregated across *all* series - that is roll-neutral, so expiry
-    # week no longer looks like a mass unwind.
+    # ---------------- futures ---------------------------------------------
     fut = fut[fut["date"].isin(lab)].copy()
     fut["day"] = fut["date"].map(lab)
     fut = fut.dropna(subset=["OpnIntrst"]).sort_values(["TckrSymb", "XpryDt", "date"])
     fut["px_chg%"] = (fut.groupby(["TckrSymb", "XpryDt"], group_keys=False)["SttlmPric"]
                          .pct_change(fill_method=None) * 100)
     near = fut.loc[fut.groupby(["TckrSymb", "day"])["XpryDt"].idxmin()]
-    price = near.pivot_table(index="TckrSymb", columns="day", values="SttlmPric",
-                             aggfunc="last").reindex(columns=cols)
-    px_pct = near.pivot_table(index="TckrSymb", columns="day", values="px_chg%",
-                              aggfunc="last").reindex(columns=cols)
-    lot = near.pivot_table(index="TckrSymb", columns="day", values="NewBrdLotQty",
-                           aggfunc="last").reindex(columns=cols)
+    price = near.pivot_table(index="TckrSymb", columns="day", values="SttlmPric", aggfunc="last").reindex(columns=cols)
+    px_pct = near.pivot_table(index="TckrSymb", columns="day", values="px_chg%", aggfunc="last").reindex(columns=cols)
+    lot = near.pivot_table(index="TckrSymb", columns="day", values="NewBrdLotQty", aggfunc="last").reindex(columns=cols)
 
     agg = fut.groupby(["TckrSymb", "day"]).agg(
         oi=("OpnIntrst", "sum"), coi=("ChngInOpnIntrst", "sum"),
         trades=("TtlNbOfTxsExctd", "sum")).reset_index()
     agg["oi_pct"] = agg["coi"] / (agg["oi"] - agg["coi"]).replace(0, pd.NA) * 100
-    oi = agg.pivot_table(index="TckrSymb", columns="day", values="oi",
-                         aggfunc="last").reindex(columns=cols)
-    oi_pct = agg.pivot_table(index="TckrSymb", columns="day", values="oi_pct",
-                             aggfunc="last").reindex(columns=cols)
-    # change in contracts per trade (workbook's futures "TQ/NT", unit-corrected)
     agg["ct_per_trade"] = agg["coi"] / agg["trades"].replace(0, pd.NA)
-    per_trade = agg.pivot_table(index="TckrSymb", columns="day", values="ct_per_trade",
-                                aggfunc="last").reindex(columns=cols)
-    per_trade = per_trade.div(lot.replace(0, pd.NA))
+    oi = agg.pivot_table(index="TckrSymb", columns="day", values="oi", aggfunc="last").reindex(columns=cols)
+    oi_pct = agg.pivot_table(index="TckrSymb", columns="day", values="oi_pct", aggfunc="last").reindex(columns=cols)
+    per_trade = (agg.pivot_table(index="TckrSymb", columns="day", values="ct_per_trade",
+                                 aggfunc="last").reindex(columns=cols)
+                    .div(lot.replace(0, pd.NA)))
 
     fa = pd.DataFrame(index=price.index)
     fa["min"] = price.min(axis=1)
     fa["max"] = price.max(axis=1)
-    fa["settle"] = price[cols[-1]]
-    fa["oi_units"] = oi[cols[-1]]
-    fa["oi_chg%_last"] = oi_pct[cols[-1]]
-    fa["oi_contracts_per_trade_20DMA"] = per_trade.mean(axis=1)
     fa["lot"] = lot[cols[-1]]
+    for c in cols:
+        fa[f"Settle_{c}"] = price[c]
+    for c in cols:
+        fa[f"PxChg%_{c}"] = px_pct[c]
+    for c in cols:
+        fa[f"OI_{c}"] = oi[c]
+    for c in cols:
+        fa[f"OIchg%_{c}"] = oi_pct[c]
+    for c in cols:
+        fa[f"OIperTrade_{c}"] = per_trade[c]
     out["fut_alys_data"] = fa.round(2).sort_index()
+    # the master's cash sheet lists the F&O universe, not all ~2,800 cash symbols
+    out["cash_alys_fno"] = ca.loc[ca.index.intersection(price.index)].round(2).sort_index()
 
-    # ---------------- options: CE / PE OI in lots -------------------------
+    # ---------------- options ---------------------------------------------
     op = opt[opt["date"].isin(lab)].copy()
     op["day"] = op["date"].map(lab)
     op["oi_lots"] = pd.to_numeric(op["oi_lots"], errors="coerce")
     op = op.dropna(subset=["oi_lots"])
+    ce = pe = None
     if not op.empty:
         per_exp = (op.groupby(["TckrSymb", "day", "XpryDt", "OptnTp"])["oi_lots"]
                      .sum().reset_index())
-        tot = (per_exp.groupby(["TckrSymb", "day", "XpryDt"])["oi_lots"].sum()
-                      .reset_index())
+        tot = per_exp.groupby(["TckrSymb", "day", "XpryDt"])["oi_lots"].sum().reset_index()
         dom = tot.loc[tot.groupby(["TckrSymb", "day"])["oi_lots"].idxmax()]
         dom = dom.merge(per_exp, on=["TckrSymb", "day", "XpryDt"], suffixes=("_tot", ""))
         ce = (dom[dom["OptnTp"] == "CE"].pivot_table(index="TckrSymb", columns="day",
@@ -291,13 +292,16 @@ def sheets(cash, fut, opt, dates, threshold):
         pe = (dom[dom["OptnTp"] == "PE"].pivot_table(index="TckrSymb", columns="day",
                                                      values="oi_lots", aggfunc="sum")
               .reindex(columns=cols))
-        oa = pd.concat({"CE_lots": ce, "PE_lots": pe}, axis=1)
-        oa = oa.reindex(columns=[f"{k}_D{i+1}" for i in range(len(cols))
-                                 for k in ("CE_lots", "PE_lots")])
-        oa["PE_by_CE_last"] = (pe[cols[-1]] / ce[cols[-1]].replace(0, pd.NA)).round(2)
-        out["op_alys_data"] = oa.round(0).sort_index()
+        oa = pd.DataFrame(index=ce.index.union(pe.index))
+        for c in cols:
+            oa[f"CE_lots_{c}"] = ce[c]
+        for c in cols:
+            oa[f"PE_lots_{c}"] = pe[c]
+        for c in cols:
+            oa[f"PCR_{c}"] = (pe[c] / ce[c].replace(0, pd.NA))
+        out["op_alys_data"] = oa.round(2).sort_index()
 
-    # ---------------- buildup summary: LB / SB / SC / LU ------------------
+    # ---------------- buildup + divergence --------------------------------
     idx = price.index.intersection(oi_pct.index)
     sig = pd.DataFrame("", index=idx, columns=cols, dtype=object)
     for c in cols:
@@ -315,41 +319,59 @@ def sheets(cash, fut, opt, dates, threshold):
     div = pd.DataFrame(index=idx, columns=cols, dtype=float)
     for c in cols:
         spot = cash_close.reindex(idx).get(c)
-        if spot is None:
-            continue
-        div[c] = ((price.get(c) - spot) / spot).abs() * 100
+        if spot is not None:
+            div[c] = ((price.get(c) - spot) / spot).abs() * 100
     div.columns = [f"{c}_div%" for c in cols]
     out["buildup_summary"] = sig.join(div.round(2)).sort_index()
 
-    # ---------------- general: settings + date table ----------------------
+    # ---------------- one-stock panel + normalised twin -------------------
+    focus = pick_focus(sig, oi_pct, cols)
+
+    metrics = [
+        ("Cash Price", cash_close.loc[focus] if focus in cash_close.index else None),
+        ("Volume", qty.loc[focus] if focus in qty.index else None),
+        ("Delivery%", dv.loc[focus] if focus in dv.index else None),
+        ("Cash Qty/Trade", qt.loc[focus] if focus in qt.index else None),
+        ("Futures Price", price.loc[focus] if focus in price.index else None),
+        ("Cumulative OI", oi.loc[focus] if focus in oi.index else None),
+        ("OI chg %", oi_pct.loc[focus] if focus in oi_pct.index else None),
+        ("FNO Contracts/Trade", per_trade.loc[focus] if focus in per_trade.index else None),
+    ]
+    if ce is not None and focus in ce.index:
+        metrics += [("CE OI lots", ce.loc[focus]), ("PE OI lots", pe.loc[focus]),
+                    ("PCR", pe.loc[focus] / ce.loc[focus].replace(0, pd.NA))]
+    if focus in sig.index:
+        metrics += [("Signal", sig.loc[focus])]
+
+    panel = pd.DataFrame({name: series.reindex(cols) if series is not None else pd.Series(dtype=float)
+                          for name, series in metrics}).T
+    panel.columns = cols
+    panel.index.name = focus
+    out["stock_specific_data"] = panel.round(2)
+
+    norm = panel.copy()
+    for name in norm.index:
+        row = pd.to_numeric(norm.loc[name], errors="coerce")
+        if row.notna().sum() < 2 or row.max() == row.min():
+            norm.loc[name] = 0.0
+            continue
+        norm.loc[name] = ((row - row.min()) / (row.max() - row.min())).round(3)
+    out["normalized_data"] = norm
+
+    # ---------------- control panel ---------------------------------------
     rows = [{"Days": c, "Date": d.strftime("%d-%b-%Y"), "ReportDate": d.strftime("%d%m%Y")}
             for c, d in zip(cols, dates)]
     rows += [
         {"Days": "", "Date": "", "ReportDate": ""},
         {"Days": "Threshold Buildup Change", "Date": threshold, "ReportDate": ""},
         {"Days": "Sessions", "Date": len(dates), "ReportDate": ""},
+        {"Days": "F&O symbols", "Date": len(price.index), "ReportDate": ""},
+        {"Days": "Cash symbols", "Date": len(px.index), "ReportDate": ""},
+        {"Days": "Focus symbol", "Date": focus, "ReportDate": ""},
         {"Days": "Generated", "Date": dt.datetime.now().strftime("%d-%b-%Y %H:%M"),
          "ReportDate": ""},
     ]
     out["general"] = pd.DataFrame(rows)
-
-    # ---------------- one-stock panel -------------------------------------
-    focus = pick_focus(sig, oi_pct, cols)
-    last = cols[-1]
-    panel = [
-        ("Cash Price", cash_close.get(last)),
-        ("Delivery%", dv.get(last)),
-        ("Qty/Trade", qt.get(last)),
-        ("Futures Price", price.get(last)),
-        ("OI (units)", oi.get(last)),
-        ("OI chg %", oi_pct.get(last)),
-        ("Signal", sig.get(last)),
-    ]
-    data = {}
-    for name, series in panel:
-        if series is not None and focus in series.index:
-            data[name] = [series.get(focus)]
-    out["stock_specific_data"] = pd.DataFrame(data, index=[focus]).T if data else pd.DataFrame()
     out["_focus"] = focus
     return out
 
@@ -367,12 +389,19 @@ def pick_focus(sig, oi_pct, cols):
 # --------------------------------------------------------------------------- #
 def write_xlsx(out: dict, path: str):
     focus = out.pop("_focus", None)
+    order = ["general", "cash_alys_fno", "fut_alys_data", "op_alys_data",
+             "buildup_summary", "stock_specific_data", "normalized_data"]
     with pd.ExcelWriter(path, engine="openpyxl") as xl:
-        for name, df in out.items():
-            df.to_excel(xl, sheet_name=name[:31])
-    # light styling: signal colours, freeze panes, widths
+        for name in [n for n in order if n in out] + [n for n in out if n not in order]:
+            if name.startswith("_"):
+                continue
+            out[name].to_excel(xl, sheet_name=name[:31])
+    # light styling: signal colours, colour scales, freeze panes, widths
     from openpyxl import load_workbook
     from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.formatting.rule import ColorScaleRule
+    from openpyxl.chart import LineChart, Reference
+    from openpyxl.utils import get_column_letter
     wb = load_workbook(path)
     for ws in wb.worksheets:
         ws.freeze_panes = "B2"
@@ -385,6 +414,27 @@ def write_xlsx(out: dict, path: str):
                 if isinstance(cell.value, str) and cell.value in SIGNAL_COLORS:
                     cell.fill = PatternFill("solid", fgColor=SIGNAL_COLORS[cell.value])
                     cell.alignment = Alignment(horizontal="center")
+        # three-colour scale over the numeric grid, like the master's colour scales
+        if ws.title in ("cash_alys_fno", "fut_alys_data", "op_alys_data") and ws.max_column > 4:
+            rng = f"B2:{get_column_letter(ws.max_column)}{ws.max_row}"
+            ws.conditional_formatting.add(rng, ColorScaleRule(
+                start_type="min", start_color="63BE7B",
+                mid_type="percentile", mid_value=50, mid_color="FFEB84",
+                end_type="max", end_color="F8696B"))
+
+    # line chart of the normalised panel, the master's "Plotted Data"
+    if "normalized_data" in wb.sheetnames:
+        ws = wb["normalized_data"]
+        if ws.max_row > 1 and ws.max_column > 2:
+            ch = LineChart()
+            ch.title = "Normalised (0-1) - one stock, 20 sessions"
+            ch.height, ch.width = 9, 24
+            data = Reference(ws, min_col=2, max_col=ws.max_column,
+                             min_row=1, max_row=ws.max_row)
+            cats = Reference(ws, min_col=2, max_col=ws.max_column, min_row=1, max_row=1)
+            ch.add_data(data, from_rows=True, titles_from_data=True)
+            ch.set_categories(cats)
+            ws.add_chart(ch, f"A{ws.max_row + 3}")
     wb.save(path)
     out["_focus"] = focus
 
@@ -429,6 +479,7 @@ def write_png(sig: pd.DataFrame, path: str, max_rows: int = 60):
 def summary_text(sig: pd.DataFrame, div: pd.DataFrame, dates) -> str:
     cols = [c for c in sig.columns if not c.endswith("_div%")]
     last = cols[-1]
+
     s = sig[last]
     lines = [f"NSE F&O buildup - {dates[-1]:%d-%b-%Y}  (D{len(cols)} of {len(cols)})", ""]
     for code in ("LB", "SB", "SC", "LU"):
@@ -441,6 +492,37 @@ def summary_text(sig: pd.DataFrame, div: pd.DataFrame, dates) -> str:
     if len(d):
         lines.append("Widest futures-vs-spot gaps: "
                      + ", ".join(f"{k} {v:.2f}%" for k, v in d.items()))
+    return "\n".join(lines)
+
+
+def inference_text(cash_sheet, fut_sheet, op_sheet, sig, cols) -> str:
+    """The reading of the sheets: biggest OI moves, delivery, PCR extremes."""
+    last = cols[-1]
+    lines = []
+    oi_col, px_col = f"OIchg%_{last}", f"PxChg%_{last}"
+    if oi_col in fut_sheet.columns:
+        oi = fut_sheet[oi_col].dropna()
+        big = oi.reindex(oi.abs().sort_values(ascending=False).index).head(6)
+        parts = []
+        for sym, v in big.items():
+            s = sig.get(last, pd.Series(dtype=object)).get(sym, "")
+            px = fut_sheet[px_col].get(sym) if px_col in fut_sheet.columns else None
+            parts.append(f"{sym} {v:+.1f}%" + (f" px{px:+.1f}%" if pd.notna(px) else "")
+                         + (f" {s}" if s else ""))
+        lines.append("Largest OI moves: " + "; ".join(parts))
+
+    dv = cash_sheet.get(f"Deliv%_{last}")
+    if dv is not None:
+        top = dv.dropna().sort_values(ascending=False).head(5)
+        lines.append("Highest delivery: " + ", ".join(f"{k} {v:.0f}%" for k, v in top.items()))
+
+    pcr = op_sheet.get(f"PCR_{last}")
+    if pcr is not None:
+        p = pcr.dropna()
+        if len(p):
+            lines.append(f"PCR: lowest {p.idxmin()} {p.min():.2f}, "
+                         f"highest {p.idxmax()} {p.max():.2f}, "
+                         f"median {p.median():.2f}")
     return "\n".join(lines)
 
 
@@ -537,6 +619,12 @@ def main():
         files += csvs
 
     text = summary_text(sig.drop(columns=div_cols), div, dates)
+    extra = inference_text(out.get("cash_alys_fno", pd.DataFrame()),
+                           out.get("fut_alys_data", pd.DataFrame()),
+                           out.get("op_alys_data", pd.DataFrame()),
+                           sig.drop(columns=div_cols), [c for c in sig.columns if not c.endswith("_div%")])
+    if extra:
+        text = text + "\n" + extra
     with open(os.path.join(args.out, "summary.txt"), "w") as fh:
         fh.write(text)
     print("\n" + text)
