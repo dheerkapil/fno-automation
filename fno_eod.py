@@ -547,14 +547,19 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
                     d = _day_index(c)
                     if d is not None:
                         pair_pe = str(c).startswith("PE_lots")
-                        ws.cell(row=2, column=col, value="" if pair_pe else f"D{d}")
-                        ws.cell(row=3, column=col, value="" if pair_pe else date_lbl.get(f"D{d}", ""))
-                        if pair_pe:
-                            # label and date span the CE+PE pair
-                            ws.merge_cells(start_row=2, start_column=col - 1,
-                                           end_row=2, end_column=col)
-                            ws.merge_cells(start_row=3, start_column=col - 1,
-                                           end_row=3, end_column=col)
+                        if name == "op_alys_data":
+                            # every column says what it is; the day and date sit
+                            # merged across the CE+PE pair on the line below
+                            ws.cell(row=2, column=col, value="PE" if pair_pe else "CE")
+                            ws.cell(row=3, column=col,
+                                    value="" if pair_pe else f"D{d}  {date_lbl.get(f'D{d}', '')}")
+                            if pair_pe:
+                                ws.merge_cells(start_row=3, start_column=col - 1,
+                                               end_row=3, end_column=col)
+                        else:
+                            ws.cell(row=2, column=col, value="" if pair_pe else f"D{d}")
+                            ws.cell(row=3, column=col,
+                                    value="" if pair_pe else date_lbl.get(f"D{d}", ""))
                         # only these two sheets fold the older sessions away;
                         # options, buildup and nifty_delivery show all 20 days
                         if master_layout and d <= 20 - show_days and \
@@ -745,7 +750,7 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
             ws.row_dimensions[r].height = 13
         for row in ws.iter_rows(min_row=1, max_row=3):
             for cell in row:
-                cell.font = Font(size=8, bold=False)
+                cell.font = Font(bold=False)
                 cell.alignment = Alignment(horizontal="center", vertical="center")
         if grid:
             ws.column_dimensions["A"].width = 2      # hidden spacer on grid sheets
