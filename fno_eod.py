@@ -314,8 +314,6 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
     fa["OIperTrade_20D_avg"] = per_trade.mean(axis=1)      # the master's BP column
     for c in cols:
         fa[f"OI_{c}"] = oi[c]
-    for c in cols:
-        fa[f"PxChg%_{c}"] = px_pct[c]
     fa["lot"] = lot[cols[-1]]        # parked last so the five blocks land on
                                      # the master's F / AA / AV / BR / CN
     out["fut_alys_data"] = _round_frame(fa).sort_index().rename_axis("SYMBOL")
@@ -569,10 +567,12 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
                     colmap[c] = col
                     pct = (str(c).startswith(("OIchg%", "PxChg%"))
                            or str(c).endswith("_div%"))
+                    whole = str(c).startswith("OIperTrade")
                     for i, v in enumerate(df[c].tolist(), start=4):
                         cell = ws.cell(row=i, column=col, value=v)
                         if isinstance(v, float):
-                            cell.number_format = "0.00%" if pct else "#,##0.##"
+                            cell.number_format = ("0.00%" if pct else
+                                                  "0" if whole else "#,##0.##")
                     ws.column_dimensions[get_column_letter(col)].width = 8
                     col += 1
                 last = col - 1
@@ -592,7 +592,8 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
             # and a scale on top would drown it out.
             SCALED = {"cash_alys_fno": {"Close", "Volume"},
                       "fut_alys_data": {"Settle", "OIchg%", "OIperTrade", "OI"},
-                      "buildup_summary": {"DIVERGENCE"}}
+                      "buildup_summary": {"DIVERGENCE"},
+                      "op_alys_data": set()}      # CE/PE get their own split scales
             allowed = SCALED.get(name)
             for gname, first, last in block_spans:
                 if not gname or gname == "SIGNAL":
@@ -647,6 +648,24 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
                         FormulaRule(formula=[f"${pt[0]}4>${ag}4"],
                                     border=Border(left=Side(style="thin"), right=Side(style="thin"),
                                                   top=Side(style="thin"), bottom=Side(style="thin"))))
+
+            # options: CE and PE are separate datasets - scale each stock's CE
+            # cells together and its PE cells together, never across the pair
+            if name == "op_alys_data":
+                ce_cols = [get_column_letter(ci) for c, ci in colmap.items()
+                           if str(c).startswith("CE_lots")]
+                pe_cols = [get_column_letter(ci) for c, ci in colmap.items()
+                           if str(c).startswith("PE_lots")]
+                for r in range(4, n_rows + 4):
+                    for group in (ce_cols, pe_cols):
+                        if not group:
+                            continue
+                        refs = " ".join(f"{g}{r}" for g in group)
+                        ws.conditional_formatting.add(
+                            refs, ColorScaleRule(start_type="min", start_color="F8696B",
+                                                 mid_type="percentile", mid_value=50,
+                                                 mid_color="FFEB84", end_type="max",
+                                                 end_color="63BE7B"))
 
             # signal fills
             if name == "buildup_summary":
@@ -734,18 +753,24 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
         if master_layout and name in HIDDEN:
             ws.sheet_state = "hidden"
 
-    if "stock_specific_data" in wb.sheetnames:
+    if "stock_specific_data" in wb.sheetnames and "normalized_data" in wb.sheetnames:
         ws = wb["stock_specific_data"]
-        if ws.max_row >= 5 and ws.max_column >= 3:
+        src = wb["normalized_data"]
+        if src.max_row >= 5 and src.max_column >= 3:
             from openpyxl.chart import LineChart, Reference
+            from openpyxl.chart.marker import Marker
             ch = LineChart()
-            ch.title = "Selected stock - 20 sessions"
-            ch.height, ch.width = 10, 26
-            data = Reference(ws, min_col=2, max_col=ws.max_column,
-                             min_row=4, max_row=ws.max_row)
-            cats = Reference(ws, min_col=2, max_col=ws.max_column, min_row=3, max_row=3)
+            ch.title = None                     # the master's chart has no title
+            ch.height, ch.width = 9, 24
+            data = Reference(src, min_col=2, max_col=src.max_column,
+                             min_row=2, max_row=src.max_row)
+            cats = Reference(src, min_col=2, max_col=src.max_column, min_row=3, max_row=3)
             ch.add_data(data, from_rows=True, titles_from_data=True)
             ch.set_categories(cats)
+            ch.legend.position = "t"            # along the top, not the side
+            for ser in ch.series:
+                ser.marker = Marker(symbol="circle", size=4)
+                ser.smooth = False
             ws.add_chart(ch, f"A{ws.max_row + 3}")
 
     if "normalized_data" in wb.sheetnames:
