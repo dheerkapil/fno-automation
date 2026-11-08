@@ -218,12 +218,17 @@ def sheets(cash, fut, opt, dates, threshold):
     qt = qty / trd.replace(0, pd.NA)
     cash_close = px.ffill(axis=1)          # last traded close, carried forward
 
+    delq = cash.pivot_table(index="SYMBOL", columns="day", values="DELIV_QTY",
+                            aggfunc="sum").reindex(columns=cols)
+
     ca = pd.DataFrame(index=px.index)
     ca["min"] = px.min(axis=1)
     ca["max"] = px.max(axis=1)
     ca["close"] = cash_close[cols[-1]]
-    ca["deliv%_20DMA"] = dv.mean(axis=1)
-    ca["qty/trade_20DMA"] = qt.mean(axis=1)
+    # window aggregates (sum/sum), the same definition the old workbook used in
+    # its AX and BV columns - not a mean of daily ratios
+    ca["deliv%_20D"] = delq.sum(axis=1) / qty.sum(axis=1).replace(0, pd.NA) * 100
+    ca["qty/trade_20D"] = qty.sum(axis=1) / trd.sum(axis=1).replace(0, pd.NA)
     ca["turnover_cr_20D"] = (qty.sum(axis=1) * ca["close"] / 1e7).round(2)
     out["cash_alys_fno"] = ca.round(2).sort_index()
 
@@ -482,6 +487,9 @@ def main():
     ap.add_argument("--days", type=int, default=20, help="window length (default 20)")
     ap.add_argument("--out", default="out", help="output directory")
     ap.add_argument("--telegram", action="store_true", help="deliver to Telegram")
+    ap.add_argument("--csv", action="store_true",
+                    help="also send every sheet as a CSV (off by default: the "
+                         "workbook already holds all of them)")
     ap.add_argument("--wait", type=int, default=0,
                     help="minutes to keep retrying if today's file is not up yet")
     ap.add_argument("--keep-cache", action="store_true")
@@ -518,19 +526,23 @@ def main():
     png = write_png(sig, os.path.join(args.out, f"buildup_{dates[-1]:%Y%m%d}.png"))
 
     files = [xlsx] + ([png] if png else [])
+    csvs = []
     for name, df in out.items():
         if name.startswith("_"):
             continue
         p = os.path.join(args.out, f"{name}_{dates[-1]:%Y%m%d}.csv")
         df.to_csv(p)
-        files.append(p)
+        csvs.append(p)
+    if args.csv:
+        files += csvs
 
     text = summary_text(sig.drop(columns=div_cols), div, dates)
     with open(os.path.join(args.out, "summary.txt"), "w") as fh:
         fh.write(text)
     print("\n" + text)
     total = sum(os.path.getsize(f) for f in files)
-    print(f"\n{len(files)} files, {total/1024:.0f} KB total -> {args.out}/")
+    print(f"\n{len(files)} files to send, {total/1024:.0f} KB "
+          f"(+{len(csvs)} CSVs kept on disk) -> {args.out}/")
 
     if args.telegram:
         token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
