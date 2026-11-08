@@ -341,7 +341,8 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
         for c in cols:
             oa[f"CE_lots_{c}"] = ce[c]
             oa[f"PE_lots_{c}"] = pe[c]
-        out["op_alys_data"] = oa.round(0).sort_index().rename_axis("SYMBOL")
+        oa = oa.round(0).astype("Int64")     # real integers, not rounded floats
+        out["op_alys_data"] = oa.sort_index().rename_axis("SYMBOL")
 
     # ---------------- buildup + divergence --------------------------------
     idx = price.index.intersection(oi_pct.index)
@@ -396,7 +397,7 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
     wide = pd.DataFrame(index=syms)
     for mname, frame in src.items():
         if mname in ("CE OI lots", "PE OI lots"):
-            frame = frame.round(0)
+            frame = frame.round(0).astype("Int64")
         for c in cols:
             wide[f"{mname}|{c}"] = (frame.reindex(syms)[c] if c in frame.columns
                                     else pd.NA)
@@ -451,6 +452,18 @@ SCALAR_SHORT = {"min_price": "min", "max_price": "max", "min_vol": "min", "max_v
                 "lot": "lot", "OIperTrade_20D_avg": "OI/T20", "min": "min", "max": "max",
                 "industry": "industry"}
 SEP_RGB = "002060"
+
+
+def _cellval(v):
+    """pandas NA / numpy scalars -> plain Excel values."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return v.item() if hasattr(v, "item") else v
 
 
 def _round_frame(df, frac_prefixes=("OIchg%", "PxChg%"), frac_suffixes=("_div%",)):
@@ -581,8 +594,8 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
                     whole = (str(c).startswith("OIperTrade")
                              or str(c).startswith(("CE_lots", "PE_lots")))
                     for i, v in enumerate(df[c].tolist(), start=4):
-                        cell = ws.cell(row=i, column=col, value=v)
-                        if isinstance(v, float):
+                        cell = ws.cell(row=i, column=col, value=_cellval(v))
+                        if isinstance(v, (int, float)):
                             cell.number_format = ("0.00%" if pct else
                                                   "#,##0" if whole else "#,##0.##")
                     ws.column_dimensions[get_column_letter(col)].width = 8
@@ -738,7 +751,7 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
             for c in df.columns:
                 ws.cell(row=2, column=col, value=SHORT.get(str(c), str(c))[:14])
                 for i, v in enumerate(df[c].tolist(), start=4):
-                    cell = ws.cell(row=i, column=col, value=v)
+                    cell = ws.cell(row=i, column=col, value=_cellval(v))
                     if isinstance(v, float):
                         cell.number_format = "#,##0.##"
                 ws.column_dimensions[get_column_letter(col)].width = 12
