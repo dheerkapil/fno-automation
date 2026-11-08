@@ -28,6 +28,7 @@ import argparse
 import datetime as dt
 import io
 import os
+import re
 import shutil
 import sys
 import time
@@ -452,179 +453,185 @@ def pick_focus(sig, oi_pct, cols):
 # --------------------------------------------------------------------------- #
 SUPPORT_COLS = {"min_price", "max_price", "min_vol", "max_vol", "min_deliv", "max_deliv",
                 "min_qtytrade", "max_qtytrade", "deliv%_20D", "qty/trade_20D",
-                "lot", "OIperTrade_20D_avg", "min", "max"}
+                "lot", "OIperTrade_20D_avg", "min", "max", "industry"}
+
+SHORT = {"Close": "Px", "Volume": "Vol", "Deliv%": "Del%", "Qty/Trade": "Q/T",
+         "Settle": "Fut", "PxChg%": "Chg%", "OI": "OI", "OIchg%": "OI%",
+         "OIperTrade": "OI/T", "CE_lots": "CE", "PE_lots": "PE", "PCR": "PCR",
+         "Deliv": "DelQ", "Vol": "Vol", "SIGNAL": "SIG", "DIVERGENCE": "DIV"}
+SCALAR_SHORT = {"min_price": "min", "max_price": "max", "min_vol": "min", "max_vol": "max",
+                "min_deliv": "min", "max_deliv": "max", "min_qtytrade": "min",
+                "max_qtytrade": "max", "deliv%_20D": "Del%20", "qty/trade_20D": "Q/T20",
+                "lot": "lot", "OIperTrade_20D_avg": "OI/T20", "min": "min", "max": "max",
+                "industry": "industry"}
+SEP_RGB = "002060"
 
 
 def _day_index(name: str):
     """D7 out of 'Close_D7' / 'OIchg%_D7' / 'D7' / 'D7_div%'."""
-    for tok in name.replace("_div%", "").split("_"):
+    for tok in str(name).replace("_div%", "").split("_"):
         if tok.startswith("D") and tok[1:].isdigit():
             return int(tok[1:])
     return None
 
 
-def write_xlsx(out: dict, path: str, show_days: int = 10, master_layout: bool = True):
-    focus = out.pop("_focus", None)
+def _plan(df):
+    """Contiguous groups, in the frame's own order: scalars stay where they sit,
+    day columns stay together per block. This reproduces the master's interleaved
+    layout - min/max, then its 20 days, then the next block."""
+    groups = []
+    for c in df.columns:
+        d = _day_index(c)
+        if d is None:
+            key, label = f"__{c}", ""
+        elif re.fullmatch(r"D\d+", str(c)):
+            key, label = "SIGNAL", "SIGNAL"
+        elif str(c).endswith("_div%"):
+            key, label = "DIVERGENCE", "DIVERGENCE"
+        else:
+            key = re.sub(r"_D\d+$", "", str(c))
+            label = key
+        if groups and groups[-1][0] == key:
+            groups[-1][1].append(c)
+        else:
+            groups.append([key, [c], label])
+    return [(label, cols) for _, cols, label in groups]
+
+
+def write_workbook(out: dict, path: str, dates, show_days: int = 10,
+                   master_layout: bool = True):
+    """Write the workbook in the master's shape: a blue separator column between
+    datasets, a group header, D-labels, a row of real dates, colour scales per
+    row inside each dataset, and all sheets at 61% zoom."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.formatting.rule import ColorScaleRule, FormulaRule
+    from openpyxl.utils import get_column_letter
+
+    out = {k: v for k, v in out.items() if not k.startswith("_")}
     order = ["general", "cash_alys_fno", "fut_alys_data", "op_alys_data",
              "buildup_summary", "nifty_delivery", "stock_specific_data",
              "normalized_data"]
-    HIDDEN_SHEETS = {"general", "nifty_delivery", "normalized_data"}
-    with pd.ExcelWriter(path, engine="openpyxl") as xl:
-        for name in [n for n in order if n in out] + [n for n in out if n not in order]:
-            if name.startswith("_"):
-                continue
-            out[name].to_excel(xl, sheet_name=name[:31])
-    # light styling: signal colours, colour scales, freeze panes, widths
-    from openpyxl import load_workbook
-    from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.formatting.rule import ColorScaleRule, FormulaRule
-    from openpyxl.styles import Border, Side
-    from openpyxl.chart import LineChart, Reference
-    from openpyxl.utils import get_column_letter
-    wb = load_workbook(path)
-    for ws in wb.worksheets:
-        ws.freeze_panes = "B2"
-        ws.column_dimensions["A"].width = 22
-        for col in ws.iter_cols(min_row=1, max_row=1):
-            col[0].font = Font(bold=True)
-            col[0].alignment = Alignment(horizontal="center", wrap_text=True)
-        for row in ws.iter_rows(min_row=2, min_col=2):
-            for cell in row:
-                if isinstance(cell.value, str) and cell.value in SIGNAL_COLORS:
-                    cell.fill = PatternFill("solid", fgColor=SIGNAL_COLORS[cell.value])
-                    cell.alignment = Alignment(horizontal="center")
-        # ---- presentation: hide support columns and the older sessions -----
-        headers = [c.value for c in ws[1]]
-        col_of = {}
-        for idx, name in enumerate(headers, start=1):
-            if isinstance(name, str):
-                col_of[name] = get_column_letter(idx)
+    HIDDEN = {"general", "nifty_delivery", "normalized_data"}
+    wb = Workbook()
+    wb.remove(wb.active)
+    date_lbl = {f"D{i+1}": d.strftime("%d-%b-%y") for i, d in enumerate(dates)}
 
-        if master_layout:
-            for idx, name in enumerate(headers, start=1):
-                if not isinstance(name, str):
-                    continue
-                di = _day_index(name)
-                hide = False
-                if name in SUPPORT_COLS:
-                    hide = True                        # min/max/aggregate = support
-                elif ws.title == "fut_alys_data" and name.startswith("PxChg%"):
-                    hide = True                        # master hides this block whole
-                elif di is not None and ws.title in ("cash_alys_fno", "fut_alys_data",
-                                                     "op_alys_data", "nifty_delivery"):
-                    hide = di <= 20 - show_days        # older sessions stay, hidden
-                elif di is not None and ws.title == "buildup_summary":
-                    hide = name.endswith("_div%") and di <= 20 - show_days
-                if hide:
-                    ws.column_dimensions[get_column_letter(idx)].hidden = True
+    for name in [n for n in order if n in out] + [n for n in out if n not in order]:
+        df = out[name]
+        ws = wb.create_sheet(name[:31])
+        ws.sheet_view.zoomScale = 61
+        ws.sheet_view.zoomScaleNormal = 61
+        grid = name in ("cash_alys_fno", "fut_alys_data", "op_alys_data",
+                        "nifty_delivery", "buildup_summary")
+        n_rows = len(df)
+        col = 1
+        hide_cols, block_spans = [], []
 
-        # ---- colour scales, one per day column (master's rule shape) --------
-        if ws.title in ("cash_alys_fno", "fut_alys_data", "op_alys_data", "nifty_delivery"):
-            for idx, name in enumerate(headers, start=1):
-                if not isinstance(name, str) or _day_index(name) is None:
+        # index column
+        ws.cell(row=2, column=col, value=df.index.name or "SYMBOL")
+        for i, v in enumerate(df.index, start=4):
+            ws.cell(row=i, column=col, value=str(v))
+        ws.column_dimensions[get_column_letter(col)].width = 15
+        col += 1
+
+        if grid:
+            groups = _plan(df)
+            for gname, cols in groups:
+                if gname:                       # day-block: give it a blue divider
+                    ws.column_dimensions[get_column_letter(col)].width = 2.2
+                    for r in range(1, n_rows + 4):
+                        ws.cell(row=r, column=col).fill = PatternFill("solid", fgColor=SEP_RGB)
+                    col += 1
+                first = col
+                for c in cols:
+                    d = _day_index(c)
+                    if d is not None:
+                        ws.cell(row=2, column=col, value=f"D{d}")
+                        ws.cell(row=3, column=col, value=date_lbl.get(f"D{d}", ""))
+                        if master_layout and d <= 20 - show_days and \
+                           name in ("cash_alys_fno", "fut_alys_data", "op_alys_data",
+                                    "nifty_delivery", "buildup_summary"):
+                            hide_cols.append(col)
+                    else:
+                        ws.cell(row=2, column=col, value=SCALAR_SHORT.get(c, str(c)[:8]))
+                        if master_layout and c in SUPPORT_COLS:
+                            hide_cols.append(col)
+                    for i, v in enumerate(df[c].tolist(), start=4):
+                        cell = ws.cell(row=i, column=col, value=v)
+                        if isinstance(v, float):
+                            cell.number_format = "#,##0.##"
+                    ws.column_dimensions[get_column_letter(col)].width = 8
+                    col += 1
+                last = col - 1
+                if last >= first:
+                    ws.merge_cells(start_row=1, start_column=first, end_row=1, end_column=last)
+                    ws.cell(row=1, column=first, value=gname)
+                    block_spans.append((gname, first, last))
+            # per-row colour scale inside each dataset
+            for gname, first, last in block_spans:
+                if not gname or gname == "SIGNAL":
                     continue
-                col = get_column_letter(idx)
-                ws.conditional_formatting.add(
-                    f"{col}2:{col}{ws.max_row}",
-                    ColorScaleRule(start_type="min", start_color="F8696B",
-                                   mid_type="percentile", mid_value=50, mid_color="FFEB84",
-                                   end_type="max", end_color="63BE7B"))
-        if ws.title == "buildup_summary":
-            for idx, name in enumerate(headers, start=1):
-                if isinstance(name, str) and name.endswith("_div%"):
-                    col = get_column_letter(idx)
+                for r in range(4, n_rows + 4):
                     ws.conditional_formatting.add(
-                        f"{col}2:{col}{ws.max_row}",
-                        ColorScaleRule(start_type="min", start_color="63BE7B",
+                        f"{get_column_letter(first)}{r}:{get_column_letter(last)}{r}",
+                        ColorScaleRule(start_type="min", start_color="F8696B",
                                        mid_type="percentile", mid_value=50,
                                        mid_color="FFEB84", end_type="max",
-                                       end_color="F8696B"))
-
-        # ---- signal fills (master dxf 5-8: LB green, SB red, SC lime, LU blue)
-        if ws.title == "buildup_summary":
-            last = ws.max_row
-            for code, rgb in SIGNAL_COLORS.items():
-                rng = None
-                day_cols = [col_of[h] for h in headers
-                            if isinstance(h, str) and _day_index(h) is not None
-                            and not h.endswith("_div%")]
-                if not day_cols:
-                    continue
-                rng = f"{day_cols[0]}2:{day_cols[-1]}{last}"
-                ws.conditional_formatting.add(
-                    rng, FormulaRule(formula=[f'{day_cols[0]}2="{code}"'],
-                                     fill=PatternFill("solid", bgColor=rgb),
-                                     stopIfTrue=False))
-
-        # ---- day-above-average highlights (master's cash rules) -------------
-        if ws.title == "cash_alys_fno" and "deliv%_20D" in col_of:
-            agg_d = col_of["deliv%_20D"]
-            agg_q = col_of.get("qty/trade_20D")
-            for h in headers:
-                if not isinstance(h, str) or not h.startswith("Deliv%_"):
-                    continue
-                dcol = col_of[h]
-                ws.conditional_formatting.add(
-                    f"{dcol}2:{dcol}{ws.max_row}",
-                    FormulaRule(formula=[f"AND({dcol}2<>\"\",{dcol}2>${agg_d}2)"],
-                                fill=PatternFill("solid", bgColor=HILITE_BLUE)))
-                if agg_q:
-                    qcol = col_of.get(h.replace("Deliv%_", "Qty/Trade_"))
-                    if qcol:
+                                       end_color="63BE7B"))
+            # signal fills
+            if name == "buildup_summary":
+                for gname, first, last in block_spans:
+                    if gname != "SIGNAL":
+                        continue
+                    c0 = get_column_letter(first)
+                    for code, rgb in SIGNAL_COLORS.items():
                         ws.conditional_formatting.add(
-                            f"{dcol}2:{dcol}{ws.max_row}",
-                            FormulaRule(formula=[f"AND({dcol}2>${agg_d}2,{qcol}2>${agg_q}2)"],
-                                        fill=PatternFill("solid", bgColor=HILITE_GREY)))
-            for h in headers:
-                if not isinstance(h, str) or not h.startswith("Qty/Trade_") or not agg_q:
-                    continue
-                qcol = col_of[h]
-                ws.conditional_formatting.add(
-                    f"{qcol}2:{qcol}{ws.max_row}",
-                    FormulaRule(formula=[f"AND({qcol}2<>\"\",{qcol}2>${agg_q}2)"],
-                                fill=PatternFill("solid", bgColor=HILITE_BLUE)))
+                            f"{c0}4:{get_column_letter(last)}{n_rows + 3}",
+                            FormulaRule(formula=[f'{c0}4="{code}"'],
+                                        fill=PatternFill("solid", bgColor=rgb)))
+        else:
+            # plain sheets: single header row, no blocks
+            for c in df.columns:
+                ws.cell(row=2, column=col, value=SHORT.get(str(c), str(c))[:14])
+                for i, v in enumerate(df[c].tolist(), start=4):
+                    cell = ws.cell(row=i, column=col, value=v)
+                    if isinstance(v, float):
+                        cell.number_format = "#,##0.##"
+                ws.column_dimensions[get_column_letter(col)].width = 12
+                col += 1
+            if name in ("stock_specific_data", "normalized_data"):
+                for r in range(4, n_rows + 4):
+                    ws.conditional_formatting.add(
+                        f"B{r}:{get_column_letter(col-1)}{r}",
+                        ColorScaleRule(start_type="min", start_color="F8696B",
+                                       mid_type="percentile", mid_value=50,
+                                       mid_color="FFEB84", end_type="max",
+                                       end_color="63BE7B"))
 
-        # ---- OI intensity box (master's fut_alys_data rule) -----------------
-        if ws.title == "fut_alys_data" and "OIperTrade_20D_avg" in col_of:
-            per_trade_cols = [col_of[h] for h in headers
-                              if isinstance(h, str) and h.startswith("OIperTrade_")
-                              and not h.endswith("_avg")]
-            oi_cols = [col_of[h] for h in headers
-                       if isinstance(h, str) and h.startswith("OIchg%_")]
-            if per_trade_cols and oi_cols:
-                ws.conditional_formatting.add(
-                    f"{oi_cols[0]}2:{oi_cols[-1]}{ws.max_row}",
-                    FormulaRule(formula=[f"${per_trade_cols[0]}2>${col_of['OIperTrade_20D_avg']}2"],
-                                border=Border(left=Side(style="thin"), right=Side(style="thin"),
-                                              top=Side(style="thin"), bottom=Side(style="thin"))))
-
-        # one scale per metric row on the single-stock panels (master: E4:XFD4)
-        if ws.title in ("stock_specific_data", "normalized_data") and ws.max_column > 2:
-            for r in range(2, ws.max_row + 1):
-                ws.conditional_formatting.add(
-                    f"B{r}:{get_column_letter(ws.max_column)}{r}",
-                    ColorScaleRule(start_type="min", start_color="F8696B",
-                                   mid_type="percentile", mid_value=50, mid_color="FFEB84",
-                                   end_type="max", end_color="63BE7B"))
-
-        if master_layout and ws.title in HIDDEN_SHEETS:
+        for c in hide_cols:
+            ws.column_dimensions[get_column_letter(c)].hidden = True
+        for r in (1, 2, 3):
+            ws.row_dimensions[r].height = 13
+        for row in ws.iter_rows(min_row=1, max_row=3):
+            for cell in row:
+                cell.font = Font(size=8, bold=False)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.freeze_panes = "B4"
+        if master_layout and name in HIDDEN:
             ws.sheet_state = "hidden"
 
-    # line chart of the normalised panel, the master's "Plotted Data"
     if "normalized_data" in wb.sheetnames:
         ws = wb["normalized_data"]
-        if ws.max_row > 1 and ws.max_column > 2:
+        if ws.max_row > 4 and ws.max_column > 2:
+            from openpyxl.chart import LineChart, Reference
             ch = LineChart()
-            ch.title = "Normalised (0-1) - one stock, 20 sessions"
+            ch.title = "Normalised 0-1 - one stock, 20 sessions"
             ch.height, ch.width = 9, 24
-            data = Reference(ws, min_col=2, max_col=ws.max_column,
-                             min_row=1, max_row=ws.max_row)
-            cats = Reference(ws, min_col=2, max_col=ws.max_column, min_row=1, max_row=1)
+            data = Reference(ws, min_col=2, max_col=ws.max_column, min_row=2, max_row=ws.max_row)
             ch.add_data(data, from_rows=True, titles_from_data=True)
-            ch.set_categories(cats)
             ws.add_chart(ch, f"A{ws.max_row + 3}")
     wb.save(path)
-    out["_focus"] = focus
 
 
 def write_png(sig: pd.DataFrame, path: str, max_rows: int = 60):
@@ -808,7 +815,8 @@ def main():
     out = sheets(cash, fut, opt, dates, THRESHOLD, raw=args.raw)
 
     xlsx = os.path.join(args.out, f"fno_eod_{dates[-1]:%Y%m%d}.xlsx")
-    write_xlsx(out, xlsx, show_days=args.show_days, master_layout=not args.full_layout)
+    write_workbook(out, xlsx, dates, show_days=args.show_days,
+                   master_layout=not args.full_layout)
     sig = out["buildup_summary"]
     div_cols = [c for c in sig.columns if c.endswith("_div%")]
     div = sig[div_cols]
