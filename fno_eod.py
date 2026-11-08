@@ -60,6 +60,15 @@ SIGNAL_MEANING = {
 # --------------------------------------------------------------------------- #
 # fetch
 # --------------------------------------------------------------------------- #
+def looks_valid(url: str, blob: bytes) -> bool:
+    """NSE sometimes answers 200 with an HTML page; reject anything that is not
+    the file we asked for."""
+    if url.endswith(".zip"):
+        return blob[:2] == b"PK"
+    head = blob[:400].lstrip(b"\xef\xbb\xbf").decode("utf-8", "ignore").upper()
+    return head.startswith("SYMBOL")
+
+
 def fetch(url: str, tries: int = 4, timeout: int = 60) -> bytes | None:
     """GET with retries. Returns None on a 404 (holiday / not published yet)."""
     last = None
@@ -69,6 +78,8 @@ def fetch(url: str, tries: int = 4, timeout: int = 60) -> bytes | None:
             if r.status_code == 404:
                 return None
             r.raise_for_status()
+            if not looks_valid(url, r.content):
+                raise ValueError(f"unexpected payload ({r.headers.get('content-type')})")
             return r.content
         except Exception as exc:                      # noqa: BLE001
             last = exc
@@ -145,14 +156,6 @@ def read_fo(blob: bytes) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     df["XpryDt"] = pd.to_datetime(df["XpryDt"], errors="coerce")
     return df
-
-
-def near_expiry(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep only the nearest expiry present for each symbol on that day."""
-    if df.empty:
-        return df
-    nearest = df.groupby("TckrSymb")["XpryDt"].transform("min")
-    return df[df["XpryDt"] == nearest]
 
 
 # --------------------------------------------------------------------------- #
@@ -232,7 +235,7 @@ def sheets(cash, fut, opt, dates, threshold):
     fut["day"] = fut["date"].map(lab)
     fut = fut.dropna(subset=["OpnIntrst"]).sort_values(["TckrSymb", "XpryDt", "date"])
     fut["px_chg%"] = (fut.groupby(["TckrSymb", "XpryDt"], group_keys=False)["SttlmPric"]
-                         .pct_change() * 100)
+                         .pct_change(fill_method=None) * 100)
     near = fut.loc[fut.groupby(["TckrSymb", "day"])["XpryDt"].idxmin()]
     price = near.pivot_table(index="TckrSymb", columns="day", values="SttlmPric",
                              aggfunc="last").reindex(columns=cols)
@@ -471,7 +474,8 @@ def main():
 
     print(f"resolving last {args.days} trading sessions up to {end} ...")
     dates = trading_dates(end, args.days)
-    if args.wait and end.weekday() < 5 and dates and dates[-1] < end:
+    cash_up = bool(cached(f"sec_{end:%Y%m%d}.csv", sec_url(end)))
+    if args.wait and end.weekday() < 5 and cash_up and dates and dates[-1] < end:
         deadline = time.time() + args.wait * 60
         print(f"  latest session is {dates[-1]}, waiting up to {args.wait} min for {end} ...")
         while time.time() < deadline and dates[-1] < end:
