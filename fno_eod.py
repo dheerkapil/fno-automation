@@ -45,6 +45,7 @@ HEADERS = {"User-Agent": UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9
 
 URL_FO = "https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{d}_F_0000.csv.zip"
 URL_SEC = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{d}.csv"
+URL_IND = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
 
 CACHE = os.environ.get("FNO_CACHE", "cache")
 THRESHOLD = float(os.environ.get("FNO_THRESHOLD", "0.08"))   # 8% OI change
@@ -66,7 +67,8 @@ def looks_valid(url: str, blob: bytes) -> bool:
     if url.endswith(".zip"):
         return blob[:2] == b"PK"
     head = blob[:400].lstrip(b"\xef\xbb\xbf").decode("utf-8", "ignore").upper()
-    return head.startswith("SYMBOL")
+    first = head.split("\n")[0]          # "SYMBOL, SERIES, ..." or "Company Name,...,SYMBOL,..."
+    return "SYMBOL" in first
 
 
 def fetch(url: str, tries: int = 4, timeout: int = 60) -> bytes | None:
@@ -107,6 +109,20 @@ def sec_url(d: dt.date) -> str:
 
 def fo_url(d: dt.date) -> str:
     return URL_FO.format(d=d.strftime("%Y%m%d"))
+
+
+def industry_map() -> dict:
+    """Symbol -> industry, the lookup the master kept on its general sheet."""
+    blob = cached("ind_nifty500list.csv", URL_IND)
+    if not blob:
+        return {}
+    try:
+        df = pd.read_csv(io.BytesIO(blob))
+        df.columns = [c.strip() for c in df.columns]
+        return dict(zip(df["Symbol"].astype(str).str.strip(),
+                        df["Industry"].astype(str).str.strip()))
+    except Exception:                                   # noqa: BLE001
+        return {}
 
 
 def trading_dates(end: dt.date, n: int) -> list[dt.date]:
@@ -200,7 +216,7 @@ def label(dates: list[dt.date]) -> dict:
 # --------------------------------------------------------------------------- #
 # the sheets
 # --------------------------------------------------------------------------- #
-def sheets(cash, fut, opt, dates, threshold):
+def sheets(cash, fut, opt, dates, threshold, raw=False):
     """Rebuild every sheet of the master workbook, full width.
 
     Each sheet keeps the master's shape: one row per symbol, then the D1..D20
@@ -221,17 +237,30 @@ def sheets(cash, fut, opt, dates, threshold):
     qt = qty / trd.replace(0, pd.NA)
     cash_close = px.ffill(axis=1)
 
+    # the master carries four 20-session blocks here - price, volume, delivery %
+    # and qty/trade - each with its own min/max pair, plus the two window
+    # aggregates that sat between them.
     ca = pd.DataFrame(index=px.index)
-    ca["min"] = px.min(axis=1)
-    ca["max"] = px.max(axis=1)
-    ca["deliv%_20D"] = delq.sum(axis=1) / qty.sum(axis=1).replace(0, pd.NA) * 100
-    ca["qty/trade_20D"] = qty.sum(axis=1) / trd.sum(axis=1).replace(0, pd.NA)
+    ca["min_price"] = px.min(axis=1)
+    ca["max_price"] = px.max(axis=1)
     for c in cols:
         ca[f"Close_{c}"] = px[c]
+    ca["min_vol"] = qty.min(axis=1)
+    ca["max_vol"] = qty.max(axis=1)
+    for c in cols:
+        ca[f"Volume_{c}"] = qty[c]
+    ca["deliv%_20D"] = delq.sum(axis=1) / qty.sum(axis=1).replace(0, pd.NA) * 100
+    ca["min_deliv"] = dv.min(axis=1)
+    ca["max_deliv"] = dv.max(axis=1)
     for c in cols:
         ca[f"Deliv%_{c}"] = dv[c]
+    ca["qty/trade_20D"] = qty.sum(axis=1) / trd.sum(axis=1).replace(0, pd.NA)
+    ca["min_qtytrade"] = qt.min(axis=1)
+    ca["max_qtytrade"] = qt.max(axis=1)
     for c in cols:
         ca[f"Qty/Trade_{c}"] = qt[c]
+    ind = industry_map()
+    ca.insert(0, "industry", [ind.get(sym, "") for sym in ca.index])
     # assigned after the futures universe is known (see below)
 
     # ---------------- futures ---------------------------------------------
@@ -270,6 +299,7 @@ def sheets(cash, fut, opt, dates, threshold):
         fa[f"OIchg%_{c}"] = oi_pct[c]
     for c in cols:
         fa[f"OIperTrade_{c}"] = per_trade[c]
+    fa["OIperTrade_20D_avg"] = per_trade.mean(axis=1)      # the master's BP column
     out["fut_alys_data"] = fa.round(2).sort_index()
     # the master's cash sheet lists the F&O universe, not all ~2,800 cash symbols
     out["cash_alys_fno"] = ca.loc[ca.index.intersection(price.index)].round(2).sort_index()
@@ -328,6 +358,7 @@ def sheets(cash, fut, opt, dates, threshold):
     focus = pick_focus(sig, oi_pct, cols)
 
     metrics = [
+        ("Date", pd.Series({c: d.strftime("%d-%b-%Y") for c, d in zip(cols, dates)})),
         ("Cash Price", cash_close.loc[focus] if focus in cash_close.index else None),
         ("Volume", qty.loc[focus] if focus in qty.index else None),
         ("Delivery%", dv.loc[focus] if focus in dv.index else None),
@@ -343,13 +374,14 @@ def sheets(cash, fut, opt, dates, threshold):
     if focus in sig.index:
         metrics += [("Signal", sig.loc[focus])]
 
-    panel = pd.DataFrame({name: series.reindex(cols) if series is not None else pd.Series(dtype=float)
+    panel = pd.DataFrame({name: (series.reindex(cols) if isinstance(series, pd.Series)
+                                 else pd.Series(dtype=float))
                           for name, series in metrics}).T
     panel.columns = cols
     panel.index.name = focus
     out["stock_specific_data"] = panel.round(2)
 
-    norm = panel.copy()
+    norm = panel.drop(index=["Date", "Signal"], errors="ignore").copy()
     for name in norm.index:
         row = pd.to_numeric(norm.loc[name], errors="coerce")
         if row.notna().sum() < 2 or row.max() == row.min():
@@ -372,6 +404,21 @@ def sheets(cash, fut, opt, dates, threshold):
          "ReportDate": ""},
     ]
     out["general"] = pd.DataFrame(rows)
+
+    if raw:
+        # the master's three hidden data sheets, for the latest session only -
+        # enough to eyeball the source rows without shipping 620k option lines
+        last_day = dates[-1]
+        out["cash_data"] = (cash[cash["date"] == last_day]
+                            .drop(columns=["date", "day"], errors="ignore")
+                            .sort_values("SYMBOL"))
+        out["futures_data"] = (fut[fut["date"] == last_day]
+                               .drop(columns=["date", "day"], errors="ignore")
+                               .sort_values("TckrSymb"))
+        out["options_data"] = (opt[opt["date"] == last_day]
+                               .drop(columns=["date", "day"], errors="ignore")
+                               .sort_values(["TckrSymb", "XpryDt", "OptnTp"]))
+
     out["_focus"] = focus
     return out
 
@@ -516,6 +563,17 @@ def inference_text(cash_sheet, fut_sheet, op_sheet, sig, cols) -> str:
         top = dv.dropna().sort_values(ascending=False).head(5)
         lines.append("Highest delivery: " + ", ".join(f"{k} {v:.0f}%" for k, v in top.items()))
 
+    ind_col = cash_sheet.get("industry")
+    sig_last = sig.get(last) if last in sig.columns else None
+    if ind_col is not None and sig_last is not None:
+        hit = sig_last[sig_last != ""]
+        if len(hit):
+            sectors = ind_col.reindex(hit.index).dropna()
+            counts = sectors[sectors != ""].value_counts().head(3)
+            if len(counts):
+                lines.append("Sector read: " + ", ".join(
+                    f"{k} {v}" for k, v in counts.items()))
+
     pcr = op_sheet.get(f"PCR_{last}")
     if pcr is not None:
         p = pcr.dropna()
@@ -569,6 +627,9 @@ def main():
     ap.add_argument("--days", type=int, default=20, help="window length (default 20)")
     ap.add_argument("--out", default="out", help="output directory")
     ap.add_argument("--telegram", action="store_true", help="deliver to Telegram")
+    ap.add_argument("--raw", action="store_true",
+                    help="also include cash/futures/options source rows for the "
+                         "latest session, as the master's hidden data sheets")
     ap.add_argument("--csv", action="store_true",
                     help="also send every sheet as a CSV (off by default: the "
                          "workbook already holds all of them)")
@@ -598,7 +659,7 @@ def main():
     print(f"  cash {len(cash):,} rows | futures {len(fut):,} | options {len(opt):,}")
 
     print("computing sheets ...")
-    out = sheets(cash, fut, opt, dates, THRESHOLD)
+    out = sheets(cash, fut, opt, dates, THRESHOLD, raw=args.raw)
 
     xlsx = os.path.join(args.out, f"fno_eod_{dates[-1]:%Y%m%d}.xlsx")
     write_xlsx(out, xlsx)
