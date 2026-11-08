@@ -415,6 +415,10 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
             continue
         norm.loc[name] = ((row - row.min()) / (row.max() - row.min())).round(3)
     out["normalized_data"] = norm
+    banded = norm.copy()
+    for i, mname in enumerate(banded.index):
+        banded.loc[mname] = norm.loc[mname] + i      # one band per metric
+    out["chart_data"] = banded
 
     out["_focus"] = focus
     return out
@@ -503,8 +507,8 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
     out = {k: v for k, v in out.items() if not k.startswith("_")}
     order = ["cash_alys_fno", "fut_alys_data", "op_alys_data",
              "buildup_summary", "stock_specific_data", "normalized_data",
-             "panel_data"]
-    HIDDEN = {"normalized_data", "panel_data"}   # chart source + selector lookup
+             "panel_data", "chart_data"]
+    HIDDEN = {"normalized_data", "panel_data", "chart_data"}
     wb = Workbook()
     wb.remove(wb.active)
     date_lbl = {f"D{i+1}": d.strftime("%d.%m.%y") for i, d in enumerate(dates)}
@@ -758,21 +762,25 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
         if master_layout and name in HIDDEN:
             ws.sheet_state = "hidden"
 
-    if "stock_specific_data" in wb.sheetnames and "normalized_data" in wb.sheetnames:
+    if "stock_specific_data" in wb.sheetnames and "chart_data" in wb.sheetnames:
         ws = wb["stock_specific_data"]
-        src = wb["normalized_data"]
+        src = wb["chart_data"]
         if src.max_row >= 5 and src.max_column >= 3:
             from openpyxl.chart import LineChart, Reference
             from openpyxl.chart.marker import Marker
             ch = LineChart()
             ch.title = None                     # the master's chart has no title
             ch.height, ch.width = 9, 24
-            data = Reference(src, min_col=2, max_col=src.max_column,
+            # start the range at column A so the row label becomes the series
+            # name - otherwise the legend shows the first value instead
+            data = Reference(src, min_col=1, max_col=src.max_column,
                              min_row=2, max_row=src.max_row)
             cats = Reference(src, min_col=2, max_col=src.max_column, min_row=3, max_row=3)
             ch.add_data(data, from_rows=True, titles_from_data=True)
             ch.set_categories(cats)
-            ch.legend.position = "t"            # along the top, not the side
+            ch.legend.position = "b"            # legend under the plot
+            ch.y_axis.majorGridlines = None     # no heavy horizontal rules
+            ch.x_axis.majorGridlines = None
             for ser in ch.series:
                 ser.marker = Marker(symbol="circle", size=4)
                 ser.smooth = False
