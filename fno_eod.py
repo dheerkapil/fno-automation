@@ -418,10 +418,6 @@ def sheets(cash, fut, opt, dates, threshold, raw=False):
             continue
         norm.loc[name] = ((row - row.min()) / (row.max() - row.min())).round(3)
     out["normalized_data"] = norm
-    banded = norm.copy()
-    for i, mname in enumerate(banded.index):
-        banded.loc[mname] = norm.loc[mname] + i      # one band per metric
-    out["chart_data"] = banded
 
     out["_focus"] = focus
     return out
@@ -522,7 +518,7 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
     out = {k: v for k, v in out.items() if not k.startswith("_")}
     order = ["cash_alys_fno", "fut_alys_data", "op_alys_data",
              "buildup_summary", "stock_specific_data", "normalized_data",
-             "panel_data", "chart_data"]
+             "panel_data"]
     HIDDEN = {"normalized_data", "panel_data", "chart_data"}
     wb = Workbook()
     wb.remove(wb.active)
@@ -779,6 +775,33 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
         if master_layout and name in HIDDEN:
             ws.sheet_state = "hidden"
 
+    # chart_data: same rows as the stock panel, offset into bands, but as
+    # formulas - so picking another symbol moves the lines as well
+    if "stock_specific_data" in wb.sheetnames:
+        src_ws = wb["stock_specific_data"]
+        cd = wb.create_sheet("chart_data")
+        cd.sheet_view.zoomScale = 61
+        metrics = [src_ws.cell(r, 1).value for r in range(4, src_ws.max_row + 1)]
+        ncols = src_ws.max_column
+        for j in range(2, ncols + 1):
+            col = get_column_letter(j)
+            cd.cell(row=2, column=j, value=src_ws.cell(2, j).value)
+            cd.cell(row=3, column=j, value=src_ws.cell(3, j).value)
+        for i, m in enumerate(metrics):
+            cd.cell(row=4 + i, column=1, value=m)
+            lastc = get_column_letter(ncols)
+            for j in range(2, ncols + 1):
+                col = get_column_letter(j)
+                r = 4 + i
+                # normalise the row to 0-1 then lift it into its own band
+                cd.cell(row=r, column=j,
+                        value=(f"=IFERROR(('stock_specific_data'!{col}{r}"
+                               f"-MIN('stock_specific_data'!$B{r}:${lastc}{r}))"
+                               f"/(MAX('stock_specific_data'!$B{r}:${lastc}{r})"
+                               f"-MIN('stock_specific_data'!$B{r}:${lastc}{r}))+{i},\"\")"))
+        cd.column_dimensions["A"].width = 22
+        cd.sheet_state = "hidden"
+
     if "stock_specific_data" in wb.sheetnames and "chart_data" in wb.sheetnames:
         ws = wb["stock_specific_data"]
         src = wb["chart_data"]
@@ -787,7 +810,7 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
             from openpyxl.chart.marker import Marker
             ch = LineChart()
             ch.title = None                     # the master's chart has no title
-            ch.height, ch.width = 9, 24
+            ch.height, ch.width = 16, 30
             # start the range at column A so the row label becomes the series
             # name - otherwise the legend shows the first value instead
             data = Reference(src, min_col=1, max_col=src.max_column,
@@ -809,7 +832,7 @@ def write_workbook(out: dict, path: str, dates, show_days: int = 10,
             from openpyxl.chart import LineChart, Reference
             ch = LineChart()
             ch.title = "Normalised 0-1 - one stock, 20 sessions"
-            ch.height, ch.width = 9, 24
+            ch.height, ch.width = 16, 30
             data = Reference(ws, min_col=2, max_col=ws.max_column, min_row=2, max_row=ws.max_row)
             ch.add_data(data, from_rows=True, titles_from_data=True)
             ws.add_chart(ch, f"A{ws.max_row + 3}")
